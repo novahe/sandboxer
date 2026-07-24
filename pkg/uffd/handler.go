@@ -47,6 +47,13 @@ type Config struct {
 	BackendVA uintptr
 	Size      int
 
+	// DirectPopulate makes data reads populate the shared memfd mapping
+	// directly, then wakes the faulting CH vCPU. It is valid only when Source
+	// is a local-file snapshot source: a write through BackendVA creates the
+	// shared shmem folio, so the retried CH fault can install its PTE without
+	// UFFDIO_COPY and its second buffer-to-memfd copy.
+	DirectPopulate bool
+
 	// Source of truth for Absent-page contents. ZeroSource for cold
 	// start; StreamSnapshotSource for restore.
 	Source SnapshotReader
@@ -130,6 +137,10 @@ type Handler struct {
 	queue      []chan faultEvent
 
 	stats handlerStats
+
+	// wakeFn is a test seam for the direct-populate completion protocol. Nil
+	// uses the kernel UFFDIO_WAKE implementation.
+	wakeFn func(fd int, start, length uint64) error
 }
 
 // removeReq carries a coalesce-able EVENT_REMOVE notification. The
@@ -148,6 +159,7 @@ type handlerStats struct {
 	copies              atomic.Uint64 // count of UFFDIO_COPY calls
 	pagesZeroed         atomic.Uint64 // total pages installed via ZEROPAGE
 	pagesCopied         atomic.Uint64 // total pages installed via COPY
+	pagesDirect         atomic.Uint64 // total pages populated through the shared backend mmap
 	wakes               atomic.Uint64
 	removeEvents        atomic.Uint64
 	errors              atomic.Uint64
@@ -193,6 +205,9 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 	if cfg.Size <= 0 || cfg.Size%PageSize != 0 {
 		return nil, fmt.Errorf("uffd: Size %d not page-aligned", cfg.Size)
+	}
+	if cfg.DirectPopulate && cfg.BackendVA == 0 {
+		return nil, errors.New("uffd: DirectPopulate requires BackendVA")
 	}
 	if cfg.Source == nil {
 		return nil, fmt.Errorf("uffd: Source is nil")
@@ -696,8 +711,16 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			capBytes = rem
 		}
 
+		readBuf := pageBuf[:capBytes]
+		if h.cfg.DirectPopulate {
+			// BackendVA is the sandbox-ctl MAP_SHARED view of the same memfd
+			// inode CH accesses. Reading the file snapshot into it creates the
+			// destination folios directly; UFFDIO_WAKE below is sufficient to
+			// release CH's missing-page fault.
+			readBuf = unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(h.cfg.BackendVA), uintptr(pageOffset))), int(capBytes))
+		}
 		tFetch := time.Now()
-		n, isZero, err := h.cfg.Source.ReadAt(pageBuf[:capBytes], pageOffset)
+		n, isZero, err := h.cfg.Source.ReadAt(readBuf, pageOffset)
 		// Record only DATA fetches (the RPC/IO path): zero-region serves are
 		// near-instant and would mask the slow-remote/cache tail. p99 here is
 		// the cold-fetch latency that reveals a degraded store.
@@ -722,7 +745,7 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			// and zero-pad; UFFDIO_* ioctls require page-aligned len.
 			pad := PageSize - runBytes%PageSize
 			for i := uint64(n); i < runBytes+pad; i++ {
-				pageBuf[i] = 0
+				readBuf[i] = 0
 			}
 			runBytes += pad
 		}
@@ -773,7 +796,7 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			}
 			h.stats.zeropages.Add(1)
 			h.stats.pagesZeroed.Add(runPages)
-		} else {
+		} else if !h.cfg.DirectPopulate {
 			src := uint64(uintptr(unsafe.Pointer(&pageBuf[0])))
 			err := ioctlUffdCopy(ev.uffdFD, pageVA, src, runBytes)
 			if (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ENOENT)) && runBytes > PageSize {
@@ -811,6 +834,22 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			h.state.Set(pageIdx+i, StateLoaded)
 		}
 		h.recordBatch(runPages)
+		if !isZero && h.cfg.DirectPopulate {
+			// The direct ReadAt above has already created the shared memfd
+			// folios. Mark state before waking so a concurrent fault observes
+			// the completed population, then let CH retry and map the folios.
+			wake := h.wakeFn
+			if wake == nil {
+				wake = ioctlUffdWake
+			}
+			if err := wake(ev.uffdFD, pageVA, runBytes); err != nil {
+				h.logf("uffd: WAKE(direct) va=0x%x len=%d: %v", pageVA, runBytes, err)
+				h.stats.errors.Add(1)
+			} else {
+				h.stats.wakes.Add(1)
+			}
+			h.stats.pagesDirect.Add(runPages)
+		}
 
 	case StateReleased:
 		h.stats.faultsReleased.Add(1)
@@ -931,6 +970,7 @@ func (h *Handler) Stats() map[string]uint64 {
 		"copy_calls":            h.stats.copies.Load(),
 		"pages_zeroed":          h.stats.pagesZeroed.Load(),
 		"pages_copied":          h.stats.pagesCopied.Load(),
+		"pages_direct":          h.stats.pagesDirect.Load(),
 		"wakes":                 h.stats.wakes.Load(),
 		"remove_events":         h.stats.removeEvents.Load(),
 		"remove_q_dropped":      h.stats.removeQDropped.Load(),
@@ -966,6 +1006,7 @@ type LazyStats struct {
 	FaultsReleased uint64
 	FaultsLoaded   uint64
 	PagesCopied    uint64
+	PagesDirect    uint64
 	PagesZeroed    uint64
 	Errors         uint64
 	Inflight       int64
@@ -980,6 +1021,7 @@ func (h *Handler) LazyStats() LazyStats {
 		FaultsReleased: h.stats.faultsReleased.Load(),
 		FaultsLoaded:   h.stats.faultsLoaded.Load(),
 		PagesCopied:    h.stats.pagesCopied.Load(),
+		PagesDirect:    h.stats.pagesDirect.Load(),
 		PagesZeroed:    h.stats.pagesZeroed.Load(),
 		Errors:         h.stats.errors.Load(),
 		Inflight:       h.stats.inflight.Load(),

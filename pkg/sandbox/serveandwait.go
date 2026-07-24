@@ -90,6 +90,10 @@ type VMParams struct {
 
 	CapBytes   int64               // RAM capacity (memfd size); also stats UffdRAMSize
 	UffdSource uffd.SnapshotReader // ZeroSource (cold) | snapshot source (restore)
+	// UffdDirectPopulate is restore-only and only safe for fully local file
+	// memory layers. It reads snapshot data straight into the shared memfd
+	// mapping and resolves CH faults with UFFDIO_WAKE instead of UFFDIO_COPY.
+	UffdDirectPopulate bool
 
 	// Disks are the logical disks served to the guest, in order: Disks[0] is
 	// the root, Disks[1:] are the boot.disks[] data disks (boot.disks[] order).
@@ -262,11 +266,12 @@ func ServeAndWait(p VMParams) (int, error) {
 		HandshakeDeadline: p.VAReportDeadline,
 		OnReady: func(uffdFD int, vaStart, size uint64) error {
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
-				MemfdFD:   memfd.FD(),
-				BackendVA: memfd.Addr(),
-				Size:      memfd.Size(),
-				Source:    p.UffdSource,
-				Logf:      logf,
+				MemfdFD:        memfd.FD(),
+				BackendVA:      memfd.Addr(),
+				Size:           memfd.Size(),
+				Source:         p.UffdSource,
+				DirectPopulate: p.UffdDirectPopulate,
+				Logf:           logf,
 			})
 			if err != nil {
 				return err

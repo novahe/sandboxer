@@ -408,7 +408,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// (no from_refs) degenerates to today's behaviour. The from_refs streams
 	// live until the run exits (closed below); selfStream is closed at open.
 	memLayers := []fetch.Stream{selfStream}
+	directPopulate := opts.SnapshotPath != ""
 	for i, ref := range parsedSnap.FromRefs {
+		scheme, _, ok := config.SchemeAndPath(ref)
+		if !ok || scheme != "file" {
+			directPopulate = false
+		}
 		s, err := openRefStream(ctx, ref, opts)
 		if err != nil {
 			return -1, fmt.Errorf("from_refs[%d] %q: %w", i, ref, err)
@@ -421,6 +426,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
+	if directPopulate {
+		logf("snapshot source: direct file populate enabled")
+	}
 	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.
@@ -521,9 +529,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		PingTimeout:        opts.HostCfg.PingDeadline(),
 		AppNotifyDeadline:  opts.HostCfg.AppNotifyDeadline(),
 
-		CapBytes:   int64(capBytes),
-		UffdSource: source,
-		Disks:      disks,
+		CapBytes:           int64(capBytes),
+		UffdSource:         source,
+		UffdDirectPopulate: directPopulate,
+		Disks:              disks,
 
 		LaunchSpec:    &proto.LaunchSpec{},
 		WireLaunchMUX: false,

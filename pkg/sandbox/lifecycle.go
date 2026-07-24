@@ -561,6 +561,7 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
 		"copy_calls",
 		"pages_zeroed",
 		"pages_copied",
+		"pages_direct",
 		"wakes",
 		"remove_events",
 		"remove_q_dropped",

@@ -36,6 +36,7 @@ type uffdStatsJSON struct {
 	CopyCalls           uint64 `json:"copy_calls"`
 	PagesZeroed         uint64 `json:"pages_zeroed"`
 	PagesCopied         uint64 `json:"pages_copied"`
+	PagesDirect         uint64 `json:"pages_direct"`
 	Wakes               uint64 `json:"wakes"`
 	RemoveEvents        uint64 `json:"remove_events"`
 	RemoveQDropped      uint64 `json:"remove_q_dropped"`
@@ -48,7 +49,7 @@ type uffdStatsJSON struct {
 	BatchPagesTotal     uint64 `json:"batch_pages_total"`
 	BatchAvgPages       uint64 `json:"batch_avg_pages"`
 	BatchMaxPages       uint64 `json:"batch_max_pages"`
-	// LazyLoadRatio = (pages_zeroed + pages_copied) / total_pages.
+	// LazyLoadRatio = (pages_zeroed + pages_copied + pages_direct) / total_pages.
 	// total_pages comes from RAMSize/PageSize. Cold-start tracks how
 	// little of declared RAM the guest actually touches; restore tracks
 	// how much of the snapshot was demand-paged before app rebooted.
@@ -182,7 +183,8 @@ func writeStatsJSON(path string, b statsBundle) error {
 func buildUffdJSON(counters map[string]uint64, ramBytes int64) *uffdStatsJSON {
 	zeroed := counters["pages_zeroed"]
 	copied := counters["pages_copied"]
-	resident := zeroed + copied
+	direct := counters["pages_direct"]
+	resident := zeroed + copied + direct
 	var totalPages uint64
 	var ratio float64
 	if ramBytes > 0 {
@@ -200,6 +202,7 @@ func buildUffdJSON(counters map[string]uint64, ramBytes int64) *uffdStatsJSON {
 		CopyCalls:           counters["copy_calls"],
 		PagesZeroed:         zeroed,
 		PagesCopied:         copied,
+		PagesDirect:         direct,
 		Wakes:               counters["wakes"],
 		RemoveEvents:        counters["remove_events"],
 		RemoveQDropped:      counters["remove_q_dropped"],

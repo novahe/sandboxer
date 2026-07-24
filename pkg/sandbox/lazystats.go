@@ -69,7 +69,8 @@ func lazyStatsTicker(ctx context.Context, base time.Duration, getUffd func() *uf
 
 		faultDelta := (u.FaultsAbsent + u.FaultsReleased + u.FaultsLoaded) -
 			(prevU.FaultsAbsent + prevU.FaultsReleased + prevU.FaultsLoaded)
-		pageDelta := (u.PagesCopied + u.PagesZeroed) - (prevU.PagesCopied + prevU.PagesZeroed)
+		pageDelta := (u.PagesCopied + u.PagesDirect + u.PagesZeroed) -
+			(prevU.PagesCopied + prevU.PagesDirect + prevU.PagesZeroed)
 		win := u.PageIn.Sub(prevU.PageIn)
 		active := faultDelta > 0 || anyDiskRead || u.Inflight > 0 || u.QueueDepth > 0
 
