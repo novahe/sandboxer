@@ -429,11 +429,28 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		defer s.Close()
 		memLayers = append(memLayers, s)
 	}
-	source, err := uffd.NewStreamSnapshotSource(ctx, fetch.NewLayered(memLayers...), capBytes)
+	allowFileBorrow := opts.HostCfg.Restore.FileMmap &&
+		opts.SnapshotPath != "" &&
+		len(memLayers) == 1
+	source, err := uffd.NewStreamSnapshotSource(
+		ctx,
+		fetch.NewLayered(memLayers...),
+		capBytes,
+		uffd.StreamSnapshotSourceOptions{AllowFileBorrow: allowFileBorrow},
+	)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
+	if opts.HostCfg.Restore.FileMmap {
+		if source.BorrowingEnabled() {
+			logf("snapshot source: local file mmap borrowing enabled; artifact must remain immutable")
+		} else if allowFileBorrow {
+			logf("snapshot source: local file mmap borrowing skipped (stream does not expose BorrowAt)")
+		} else {
+			logf("snapshot source: local file mmap borrowing skipped (requires a single local memory layer)")
+		}
+	}
 	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.

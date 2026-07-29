@@ -150,27 +150,32 @@ type removeReq struct {
 }
 
 type handlerStats struct {
-	faultsAbsent        atomic.Uint64
-	faultsReleased      atomic.Uint64
-	faultsLoaded        atomic.Uint64 // MISSING faults on StateLoaded pages (folio reclaimed by post-settled balloon PUNCH; must re-fill)
-	zeropages           atomic.Uint64 // count of UFFDIO_ZEROPAGE calls
-	copies              atomic.Uint64 // count of UFFDIO_COPY calls
-	pagesZeroed         atomic.Uint64 // total pages installed via ZEROPAGE
-	pagesCopied         atomic.Uint64 // total pages installed via COPY
-	wakes               atomic.Uint64
-	removeEvents        atomic.Uint64
-	errors              atomic.Uint64
-	batchPagesSum       atomic.Uint64 // sum of run lengths (for avg calc)
-	batchCalls          atomic.Uint64 // count of batches (avg = sum/calls)
-	batchMaxPages       atomic.Uint64 // largest single batch observed
-	madviseCalls        atomic.Uint64 // madvise(DONTNEED) syscalls issued on backendVA
-	madviseBytes        atomic.Uint64 // total bytes advised DONTNEED
-	removeQDropped      atomic.Uint64 // events that fell back to sync flush (queue full)
-	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
-	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
+	faultsAbsent           atomic.Uint64
+	faultsReleased         atomic.Uint64
+	faultsLoaded           atomic.Uint64 // MISSING faults on StateLoaded pages (folio reclaimed by post-settled balloon PUNCH; must re-fill)
+	zeropages              atomic.Uint64 // count of UFFDIO_ZEROPAGE calls
+	copies                 atomic.Uint64 // count of UFFDIO_COPY calls
+	borrowedCopies         atomic.Uint64 // COPY calls sourced directly from a borrowed local-file mapping
+	pagesZeroed            atomic.Uint64 // total pages installed via ZEROPAGE
+	pagesCopied            atomic.Uint64 // total pages installed via COPY
+	pagesBorrowed          atomic.Uint64 // confirmed pages resolved from a borrowed local-file mapping
+	borrowedPartial        atomic.Uint64 // borrowed multi-page COPY attempts narrowed after a partial/conflicting result
+	borrowedFallbackErrors atomic.Uint64 // BorrowAt errors that fell back to buffered ReadAt
+	wakes                  atomic.Uint64
+	removeEvents           atomic.Uint64
+	errors                 atomic.Uint64
+	batchPagesSum          atomic.Uint64 // sum of run lengths (for avg calc)
+	batchCalls             atomic.Uint64 // count of batches (avg = sum/calls)
+	batchMaxPages          atomic.Uint64 // largest single batch observed
+	madviseCalls           atomic.Uint64 // madvise(DONTNEED) syscalls issued on backendVA
+	madviseBytes           atomic.Uint64 // total bytes advised DONTNEED
+	removeQDropped         atomic.Uint64 // events that fell back to sync flush (queue full)
+	removeEventsBatched    atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
+	backendLookupMiss      atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
 
-	inflight atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
-	pageIn   latHist      // page-in FETCH latency (data Source.ReadAt; the slow-remote/cache signal)
+	inflight    atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
+	sourceRead  latHist      // buffered data-source latency; borrowed mmap copies do not sample this
+	dataResolve latHist      // common data path boundary: source selection/read through UFFD resolution
 }
 
 type faultEvent struct {
@@ -676,6 +681,30 @@ func (h *Handler) recordBatch(pages uint64) {
 	}
 }
 
+func readFaultSource(source SnapshotReader, pageBuf []byte, memfdOffset uint64) (copyBuf []byte, n int, isZero, borrowed bool, borrowErr, err error) {
+	if borrower, ok := source.(SnapshotBorrower); ok {
+		data, borrowOK, berr := borrower.BorrowAt(memfdOffset, uint64(len(pageBuf)))
+		if borrowOK {
+			if len(data) >= PageSize && len(data) <= len(pageBuf) && len(data)%PageSize == 0 {
+				// UFFDIO_COPY requires page-aligned dst and len, not src.
+				// Keep accepting tar-backed views whose packed offset is
+				// only TAR-block-aligned (512 bytes).
+				return data, len(data), false, true, nil, nil
+			}
+		}
+		borrowErr = berr
+	}
+	n, isZero, err = source.ReadAt(pageBuf, memfdOffset)
+	return pageBuf, n, isZero, false, borrowErr, err
+}
+
+func (h *Handler) recordBorrowedCopy(pages uint64, installed bool) {
+	h.stats.borrowedCopies.Add(1)
+	if installed {
+		h.stats.pagesBorrowed.Add(pages)
+	}
+}
+
 func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	h.stats.inflight.Add(1)
 	defer h.stats.inflight.Add(-1)
@@ -711,13 +740,29 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			capBytes = rem
 		}
 
-		tFetch := time.Now()
-		n, isZero, err := h.cfg.Source.ReadAt(pageBuf[:capBytes], pageOffset)
-		// Record only DATA fetches (the RPC/IO path): zero-region serves are
-		// near-instant and would mask the slow-remote/cache tail. p99 here is
-		// the cold-fetch latency that reveals a degraded store.
-		if err == nil && !isZero {
-			h.stats.pageIn.record(uint64(time.Since(tFetch).Nanoseconds()))
+		tResolve := time.Now()
+		// Invariant: pageOffset is the aligned faulting page and the source
+		// contract makes copyBuf[0] correspond exactly to pageOffset/pageVA.
+		// The batched COPY fallback below relies on this when it retries only
+		// pageVA using the first page at src.
+		copyBuf, n, isZero, borrowed, borrowErr, err := readFaultSource(
+			h.cfg.Source,
+			pageBuf[:capBytes],
+			pageOffset,
+		)
+		if borrowErr != nil {
+			h.stats.borrowedFallbackErrors.Add(1)
+			h.logf(
+				"uffd: BorrowAt disabled after off=0x%x error; using buffered ReadAt: %v",
+				pageOffset,
+				borrowErr,
+			)
+		}
+		// Buffered reads have a distinct source histogram. The common
+		// dataResolve histogram is recorded only after UFFDIO_COPY/WAKE
+		// succeeds, so buffered and borrowed A/Bs use one boundary.
+		if err == nil && !isZero && !borrowed {
+			h.stats.sourceRead.record(uint64(time.Since(tResolve).Nanoseconds()))
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			h.logf("uffd: source.ReadAt off=0x%x cap=%d: %v", pageOffset, capBytes, err)
@@ -789,21 +834,29 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			h.stats.zeropages.Add(1)
 			h.stats.pagesZeroed.Add(runPages)
 		} else {
-			src := uint64(uintptr(unsafe.Pointer(&pageBuf[0])))
+			src := uint64(uintptr(unsafe.Pointer(&copyBuf[0])))
 			err := ioctlUffdCopy(ev.uffdFD, pageVA, src, runBytes)
 			if (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ENOENT)) && runBytes > PageSize {
+				if borrowed {
+					// ioctlUffdCopy does not expose uffdio_copy.copy, so
+					// neighbouring pages installed by a partial attempt are
+					// deliberately not claimed by pages_borrowed_confirmed.
+					h.stats.borrowedPartial.Add(1)
+				}
 				// Same partial-install fallback as ZEROPAGE: a batched
 				// EAGAIN/EEXIST/ENOENT means some page in the run already
 				// has a folio (or ran off the region — safety net post
 				// clamp) and need not be the faulting page. Retry the
-				// faulting page only (pageBuf[0:PageSize] already holds
-				// its source bytes) so we never mark a page Loaded that
-				// we did not resolve — otherwise the vCPU re-faults
-				// forever (fault↔WAKE livelock).
+				// faulting page only. By the invariant above, src points to
+				// copyBuf[0], which is exactly pageVA's source page. This
+				// remains true for both the worker buffer and BorrowAt.
+				// Never offset src to the overlapping neighbour: we must
+				// resolve pageVA or the vCPU can fault↔WAKE livelock.
 				err = ioctlUffdCopy(ev.uffdFD, pageVA, src, PageSize)
 				runBytes = PageSize
 				runPages = 1
 			}
+			copyInstalled := err == nil
 			if err != nil {
 				if errors.Is(err, unix.EEXIST) {
 					_ = ioctlUffdWake(ev.uffdFD, pageVA, runBytes)
@@ -817,6 +870,11 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 					h.stats.errors.Add(1)
 					return
 				}
+			}
+			h.stats.dataResolve.record(uint64(time.Since(tResolve).Nanoseconds()))
+			if borrowed {
+				h.recordBorrowedCopy(runPages, copyInstalled)
+				runtime.KeepAlive(copyBuf)
 			}
 			h.stats.copies.Add(1)
 			h.stats.pagesCopied.Add(runPages)
@@ -939,25 +997,29 @@ func (h *Handler) Stats() map[string]uint64 {
 		avgBatch = pagesSum / calls
 	}
 	return map[string]uint64{
-		"faults_absent":         h.stats.faultsAbsent.Load(),
-		"faults_released":       h.stats.faultsReleased.Load(),
-		"faults_loaded":         h.stats.faultsLoaded.Load(),
-		"zeropage_calls":        h.stats.zeropages.Load(),
-		"copy_calls":            h.stats.copies.Load(),
-		"pages_zeroed":          h.stats.pagesZeroed.Load(),
-		"pages_copied":          h.stats.pagesCopied.Load(),
-		"wakes":                 h.stats.wakes.Load(),
-		"remove_events":         h.stats.removeEvents.Load(),
-		"remove_q_dropped":      h.stats.removeQDropped.Load(),
-		"remove_events_batched": h.stats.removeEventsBatched.Load(),
-		"madvise_calls":         h.stats.madviseCalls.Load(),
-		"madvise_bytes":         h.stats.madviseBytes.Load(),
-		"backend_lookup_miss":   h.stats.backendLookupMiss.Load(),
-		"errors":                h.stats.errors.Load(),
-		"batch_calls":           calls,
-		"batch_pages_total":     pagesSum,
-		"batch_avg_pages":       avgBatch,
-		"batch_max_pages":       h.stats.batchMaxPages.Load(),
+		"faults_absent":            h.stats.faultsAbsent.Load(),
+		"faults_released":          h.stats.faultsReleased.Load(),
+		"faults_loaded":            h.stats.faultsLoaded.Load(),
+		"zeropage_calls":           h.stats.zeropages.Load(),
+		"copy_calls":               h.stats.copies.Load(),
+		"borrowed_copy_calls":      h.stats.borrowedCopies.Load(),
+		"borrowed_partial_batches": h.stats.borrowedPartial.Load(),
+		"borrowed_fallback_errors": h.stats.borrowedFallbackErrors.Load(),
+		"pages_zeroed":             h.stats.pagesZeroed.Load(),
+		"pages_copied":             h.stats.pagesCopied.Load(),
+		"pages_borrowed_confirmed": h.stats.pagesBorrowed.Load(),
+		"wakes":                    h.stats.wakes.Load(),
+		"remove_events":            h.stats.removeEvents.Load(),
+		"remove_q_dropped":         h.stats.removeQDropped.Load(),
+		"remove_events_batched":    h.stats.removeEventsBatched.Load(),
+		"madvise_calls":            h.stats.madviseCalls.Load(),
+		"madvise_bytes":            h.stats.madviseBytes.Load(),
+		"backend_lookup_miss":      h.stats.backendLookupMiss.Load(),
+		"errors":                   h.stats.errors.Load(),
+		"batch_calls":              calls,
+		"batch_pages_total":        pagesSum,
+		"batch_avg_pages":          avgBatch,
+		"batch_max_pages":          h.stats.batchMaxPages.Load(),
 	}
 }
 
@@ -975,7 +1037,7 @@ func (h *Handler) QueueDepth() int {
 }
 
 // LazyStats is a point-in-time view of the lazy-load counters + live gauges +
-// page-in latency, for the periodic stats logger (and rate computation).
+// source/read and common data-resolution latency for the periodic stats logger.
 type LazyStats struct {
 	FaultsAbsent   uint64
 	FaultsReleased uint64
@@ -985,7 +1047,8 @@ type LazyStats struct {
 	Errors         uint64
 	Inflight       int64
 	QueueDepth     int
-	PageIn         LatSnapshot // data-fetch latency histogram (cumulative; .Sub for a window)
+	SourceRead     LatSnapshot // buffered source ReadAt latency; borrowed copies do not sample it
+	DataResolve    LatSnapshot // source selection/read through successful UFFD resolution
 }
 
 // LazyStats snapshots the counters + gauges in one call.
@@ -999,6 +1062,7 @@ func (h *Handler) LazyStats() LazyStats {
 		Errors:         h.stats.errors.Load(),
 		Inflight:       h.stats.inflight.Load(),
 		QueueDepth:     h.QueueDepth(),
-		PageIn:         h.stats.pageIn.snapshot(),
+		SourceRead:     h.stats.sourceRead.snapshot(),
+		DataResolve:    h.stats.dataResolve.snapshot(),
 	}
 }

@@ -105,6 +105,12 @@ const (
 // and can be rejected with a field-specific validation error.
 type RestoreConfig struct {
 	Prefetch string `yaml:"prefetch,omitempty"`
+	// FileMmap opts a local, single-layer snapshot into the mmap-backed
+	// BorrowAt fast path. It is off by default because faults on a mapped
+	// artifact can SIGBUS the process if the backing file is truncated or
+	// otherwise becomes unreadable. Callers enabling it must guarantee that
+	// the content-addressed artifact remains immutable for the whole run.
+	FileMmap bool `yaml:"file_mmap,omitempty"`
 }
 
 // ParsePrefetchMode validates the public restore.prefetch spelling and returns

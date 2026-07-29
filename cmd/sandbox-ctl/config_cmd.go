@@ -248,6 +248,7 @@ const skeletonRestore = `# restore host yaml — sandbox-ctl run --restore <ref>
 # Cold-only fields (kernel, launch, mounts, ...) are intentionally absent.
 restore:
   prefetch: off                            # off (default) | memory (remote memory snapshot only)
+  file_mmap: false                         # opt-in local single-layer mmap; artifact must stay immutable
 resources:
   capacity: { cpu: 2, memory: 8GiB }       # must equal the snapshot.cfg capacity
 network:

@@ -70,7 +70,8 @@ func lazyStatsTicker(ctx context.Context, base time.Duration, getUffd func() *uf
 		faultDelta := (u.FaultsAbsent + u.FaultsReleased + u.FaultsLoaded) -
 			(prevU.FaultsAbsent + prevU.FaultsReleased + prevU.FaultsLoaded)
 		pageDelta := (u.PagesCopied + u.PagesZeroed) - (prevU.PagesCopied + prevU.PagesZeroed)
-		win := u.PageIn.Sub(prevU.PageIn)
+		sourceWin := u.SourceRead.Sub(prevU.SourceRead)
+		resolveWin := u.DataResolve.Sub(prevU.DataResolve)
 		active := faultDelta > 0 || anyDiskRead || u.Inflight > 0 || u.QueueDepth > 0
 
 		prevU, last = u, now
@@ -84,9 +85,11 @@ func lazyStatsTicker(ctx context.Context, base time.Duration, getUffd func() *uf
 			continue
 		}
 		idle, sleep = 0, fast
-		logf("[lazy] uffd %.0f fault/s %.0f pgin/s inflight=%d queued=%d fetch_p50=%s p99=%s max=%s%s",
+		logf("[lazy] uffd %.0f fault/s %.0f pgin/s inflight=%d queued=%d source_p50=%s p99=%s resolve_p50=%s p99=%s max=%s%s",
 			float64(faultDelta)/elapsed, float64(pageDelta)/elapsed, u.Inflight, u.QueueDepth,
-			fmtNs(win.P50()), fmtNs(win.P99()), fmtNs(win.MaxNs), diskSeg.String())
+			fmtNs(sourceWin.P50()), fmtNs(sourceWin.P99()),
+			fmtNs(resolveWin.P50()), fmtNs(resolveWin.P99()), fmtNs(resolveWin.MaxNs),
+			diskSeg.String())
 	}
 }
 

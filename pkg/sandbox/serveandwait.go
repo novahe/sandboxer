@@ -243,7 +243,10 @@ func ServeAndWait(p VMParams) (int, error) {
 
 	// uffdHandler is constructed inside the va_report OnReady callback
 	// once we have CH's uffd fd. Held here so the deferred Close can
-	// reach it after ctx cancellation.
+	// reach it after ctx cancellation. This defer is also the lifetime
+	// barrier for p.UffdSource: Handler.Close joins every fault worker
+	// before ServeAndWait returns, so the caller may close/unmap the
+	// source stream only after this function returns.
 	var uffdHandler *uffd.Handler
 	var uffdHandlerMu sync.Mutex
 	defer func() {

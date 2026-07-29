@@ -38,6 +38,23 @@ type SnapshotReader interface {
 	ReadAt(buf []byte, memfdOffset uint64) (n int, zero bool, err error)
 }
 
+// SnapshotBorrower is an optional zero-copy-source companion to
+// SnapshotReader. BorrowAt returns a stable read-only Data view that the
+// handler may pass directly to UFFDIO_COPY, avoiding the intermediate worker
+// buffer. The view must remain valid until the SnapshotReader's owner closes
+// it.
+//
+// data[0] must correspond exactly to memfdOffset. This keeps the faulting page
+// at the start of the borrowed run, which the handler's single-page retry
+// relies on after a partial batched UFFDIO_COPY.
+//
+// ok is false when the source cannot safely borrow this range; the handler
+// falls back to SnapshotReader.ReadAt. Successful data must be page-aligned in
+// length and bounded by maxBytes.
+type SnapshotBorrower interface {
+	BorrowAt(memfdOffset, maxBytes uint64) (data []byte, ok bool, err error)
+}
+
 // ZeroSource implements SnapshotReader for cold-start. Every page is
 // zero; the source never writes to buf.
 type ZeroSource struct{}

@@ -565,6 +565,7 @@ launch:
 # 仅为经过工作集评估的特定 sandbox 显式改为 memory(§7.1).冷启动忽略此策略.
 restore:
   prefetch: off                 # off(默认) | memory(仅远程内存 snapshot)
+  file_mmap: false              # 默认关闭;仅不可变的本地单层 snapshot 可显式开启
 
 # host 侧恢复/生命周期超时;guest/远程耦合项默认 0 = 不强制(host 等待 guest/懒加载所需的
 # 任意时长,dial/connect 探测仍有界),便于慢速/降级环境:慢的远程仓库/缓存、或调试器暂停都不会
@@ -1503,6 +1504,19 @@ EROFS,CoW 和本地 `file://` snapshot 也不参与.accelerator 的接口没有 
 
 所以 `memory` 实际遍历当前顶层 bundle 的所有可见 Data chunks,包含很小的 ZIP tail,
 并非严格的 `[0, ramSize)`.ZIP entries 在 Prefetch 启动前已按需读取,通常已命中 cache.
+
+### 7.2 本地单层内存 mmap
+
+`restore.file_mmap` 默认 `false`.显式设为 `true` 时,只有输入为本地 snapshot 且
+`from_refs` 为空的单层内存源才可通过只读 mmap 把连续 Data extent 直接作为
+`UFFDIO_COPY` 的 source,省去 `ReadAt → worker pageBuf` 的中间复制.多层、远程、
+hole/zero、映射失败或不连续 extent 均回退到原有 buffered `ReadAt` 路径.
+
+挂载后的 NFS 路径可以使用该模式,但启用者必须保证 content-addressed snapshot
+artifact 在 sandbox 整个生命周期内不可被原地修改或截断,并接受 NFS 可用性成为
+映射页访问的运行时前提.文件映射建立后若 backing object 缩短或不可读,访问映射页
+可能向 sandbox-ctl 进程发送 `SIGBUS`,无法像 `ReadAt` 一样作为普通 I/O error
+恢复.因此该开关是受控 PoC/部署策略,不是本地 `file://`(包括 NFS mount)的默认行为.
 若未来要求严格 RAM 范围,应先扩展 accelerator 的 range Prefetch 契约.
 
 任务在最终内存 source 成功构造后启动 goroutine,立即让恢复主流程继续.它不阻塞
@@ -1979,6 +1993,7 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `resources.capacity.{cpu,memory}` | 与 snapshot.cfg 严格相等才允许;不一致拒绝启动(error: "capacity mismatch") | 直接用 snapshot.cfg.resources.capacity |
 | `resources.allocatable.*` | 与冷启动语义相同(host 资源策略) | 沿用冷启动默认(等于 capacity) |
 | `restore.prefetch` | `memory` 在满足 §7.1 资格时异步预取当前远程内存顶层;`off` 显式关闭 | 默认关闭;不从 snapshot.cfg 继承 |
+| `restore.file_mmap` | `true` 允许满足 §7.2 条件的本地单层内存源使用 mmap BorrowAt | 默认关闭;不从 snapshot.cfg 继承 |
 | `network.{tap\|tapfd}` | 最多一个且存在性必须与 config.json 中的快照 NIC 拓扑一致;tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | 仅无 NIC 快照允许;联网快照报拓扑不匹配 |
 | `network.{ip,mtu,nexthop,hostname,interface}` | 仅存在网络源时允许;经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 无 NIC 快照保持无 NIC;联网快照保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |

@@ -361,12 +361,15 @@ func TestParsePrefetchMode(t *testing.T) {
 }
 
 func TestRestorePrefetchValidation(t *testing.T) {
-	cfg, err := Load(writeYAML(t, minimalCold+"\nrestore:\n  prefetch: memory\n"))
+	cfg, err := Load(writeYAML(t, minimalCold+"\nrestore:\n  prefetch: memory\n  file_mmap: true\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Restore.Prefetch != "memory" {
 		t.Fatalf("restore.prefetch = %q, want memory", cfg.Restore.Prefetch)
+	}
+	if !cfg.Restore.FileMmap {
+		t.Fatal("restore.file_mmap = false, want true")
 	}
 	if err := cfg.ValidateCold(); err != nil {
 		t.Fatalf("ValidateCold(memory): %v", err)

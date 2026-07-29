@@ -138,7 +138,12 @@ func TestStreamSnapshotSource_LayeredMultiPageChunks(t *testing.T) {
 		}
 	}
 
-	src, err := NewStreamSnapshotSource(context.Background(), fetch.NewLayered(top, base), uint64(n)*PageSize)
+	src, err := NewStreamSnapshotSource(
+		context.Background(),
+		fetch.NewLayered(top, base),
+		uint64(n)*PageSize,
+		StreamSnapshotSourceOptions{},
+	)
 	if err != nil {
 		t.Fatalf("NewStreamSnapshotSource: %v", err)
 	}
@@ -156,7 +161,12 @@ func TestStreamSnapshotSource_LayeredManifest(t *testing.T) {
 	// top: data on 0,2,4; holes elsewhere (fall through to base).
 	top := buildPageStream(t, n, []byte{0xA0, 0x00, 0xA2, 0x00, 0xA4, 0x00, 0x00, 0x00})
 
-	src, err := NewStreamSnapshotSource(context.Background(), fetch.NewLayered(top, base), uint64(n)*PageSize)
+	src, err := NewStreamSnapshotSource(
+		context.Background(),
+		fetch.NewLayered(top, base),
+		uint64(n)*PageSize,
+		StreamSnapshotSourceOptions{},
+	)
 	if err != nil {
 		t.Fatalf("NewStreamSnapshotSource: %v", err)
 	}
