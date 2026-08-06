@@ -242,7 +242,7 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 - cold `ready`:host 收到本次 run 的首个现有 `app_started`,并且成功把
   `TypeAck` 完整写回 guest 后写出。应用原地 restart 的后续 `app_started` 不重复
   `ready`;该边界不证明最终目标程序 `execve` 成功,也不表示业务服务健康。
-- restore `ready`:依次完成 CH API `WaitReady`、`/vm.resume`、
+- restore `ready`:`vm/restored` 事件(--event-monitor fd)、
   `OpenMUXViaRestore` 收到 `restore_ack`、host `EstablishMUX` 后写出。pinger、balloon、
   `SettledRestore`、heartbeat 与 sensor 不在该 barrier 内;不推断 guest thaw-complete。
 
@@ -671,7 +671,7 @@ restore:
 # 任意时长,dial/connect 探测仍有界),便于慢速/降级环境:慢的远程仓库/缓存、或调试器暂停都不会
 # 误中止一个仍在健康推进的 restore。生产环境按 examples/timeouts-production.yaml 设正值快速失败。
 timeouts:
-  restore: ""       # 等 guest restore_ack(/vm.resume 之后);恢复时大量缺页换入会拉长此段
+  restore: ""       # 等 guest restore_ack(vm/restored 之后);恢复时大量缺页换入会拉长此段
   ch_api: ""        # 所有 CH HTTP API 调用(pause/resume/snapshot/shutdown)的单次响应死线;
                     #   dial 仍 5s 有界。**例外:默认 60s**(CH API 是本地管理调用、快且不受远程/
                     #   缓存影响,60s 是安全网而非热限);置 "0" 表示不强制
@@ -727,8 +727,8 @@ launch 握手,不下发 guest。
 取数路径**本身不设 runtime 超时**——它们阻塞在 accelerator 客户端上,而该客户端
 `cache.timeout` / `store.timeout` **`<=0` 即"无逐操作 deadline"**(dial 仍有界),
 故慢的远程/缓存只会让换入变慢、不会误超时;恶劣环境把这两个值调大或置 0 即可。会
-**非自愿误触发**的是 host 侧写死的管理/恢复面 deadline(restore 握手、CH `/vm.resume`
-响应、CH API socket 就绪、va_report 交接,以及 **host→guest ping** 与 **guest→host
+**非自愿误触发**的是 host 侧写死的管理/恢复面 deadline(restore 握手、vm/restored
+事件就绪、va_report 交接,以及 **host→guest ping** 与 **guest→host
 管理消息(mem_report / app_started / app_exited)** 的读死线——后两者在 vCPU 被慢缺页
 阻塞时最易误判为 ping 超时 / mem_report broken-pipe)——这些一律由
 `timeouts` 接管,默认 0 = 不强制(host 等待所需任意时长,dial/connect 探测仍有界,可经
@@ -736,7 +736,7 @@ SIGINT / CH 退出取消)。这样默认配置在慢速或降级环境下"开箱
 [`examples/timeouts-production.yaml`](../examples/timeouts-production.yaml) 设正值,
 让 restore 在真正卡死时快速失败。
 
-所有 CH API 调用(restore 的 /vm.resume、snapshot 的 pause/snapshot/resume、关停的
+所有 CH API 调用(snapshot 的 pause/snapshot/resume、关停的
 vmm.shutdown)统一经**单一 `pkg/chapi` 客户端**(`chapi.Client`,`timeouts.ch_api` 作
 其响应死线)。`ch_api` 是唯一**默认有界(60s)**的项:
 CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全网而非热限;置 `"0"` 才不强制。
@@ -1672,7 +1672,8 @@ T12 CH (patched) 启动:同冷启动 T17a-T17c(创建 uffd_C,sendmsg va_report);
     CH 进入 paused 状态
 T13 sandbox-ctl 在 va_report 收到 sendmsg 后:
     addrMap.RegisterVMA(ProcessCH, chVA),起 epoll(uffd_C)+ worker pool,回 ack
-T14 sandbox-ctl 调 PUT /api/v1/vm.resume → vCPU 从 snapshot 时刻继续
+T14 `--restore resume=true`:CH restore 完成后原地 resume vCPU(snapshot 时刻继续);
+    host 经 `--event-monitor` fd 等 `vm/restored` 作 restore-done 屏障
     首访 RAM → fault → handler Absent 分支 → snapshotReader.ReadAt → UFFDIO_COPY。
     分层流内部:命中本快照 / 某祖先则取该层数据;合并空洞 → UFFDIO_ZEROPAGE(无取数)
 T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 listener
@@ -1732,7 +1733,7 @@ artifacts 和离线 inspect/upload 不会因 open 产生投机 I/O.两种后端�
 API;snapshot bundle 的 ZIP/tar 尾部也在当前 self 的 whole-bundle 预热边界内.
 
 任务在最终内存 source 成功构造后启动 goroutine,立即让恢复主流程继续.它不阻塞
-`/vm.resume` 或 `restore_ack`,可以与磁盘重建,网络准备,CH restore 以及恢复后的
+`vm/restored` 屏障或 `restore_ack`,可以与磁盘重建,网络准备,CH restore 以及恢复后的
 首批 UFFD demand 重叠.Prefetch 失败采用 fail-open:只结束后台任务并记录日志,
 不取消 restore,不得让 `restore.Run` 返回错误;后续缺页仍通过原有 demand ReadAt
 完成校验,解密和 `UFFDIO_COPY`.不重试,不 pin,不在 sandboxer 增加 chunk 去重,
@@ -1770,7 +1771,7 @@ Prefetch 不能并发 Close;任务句柄的 `Stop` 必须幂等并完成 cancel 
 本地组应固定同一个 physical artifact 并尽量统一宿主 page-cache 初始状态.两组都
 固定 S1/S2 工件、代表性业务脚本和 VM 配置,随机化顺序并重复采样,比较 restore
 ack、应用 ready、首个代表性请求、UFFD demand 延迟与读取量及额外 I/O.
-`/vm.resume` 和 `restore_ack` 不以 Prefetch 完成为屏障;单次 benchmark、manifest
+`vm/restored` 和 `restore_ack` 不以 Prefetch 完成为屏障;单次 benchmark、manifest
 `completed` 或 file `advised` 日志都不能作为默认开启依据.
 
 CH patched 在 create_ram_region 严格按以下顺序确保 va_report ordering:
@@ -2091,7 +2092,7 @@ startup → settled,不进入 burst / recover;restoring 仅在快照恢复路径
 | **admitted** | 收到 Admit grant | reservation 占用预算,沙箱未启动 | 验证 cgroup_path,准备 socket |
 | **creating** | 开始创建 CH 等 | reservation 持有 | 拉起 CH、handshake |
 | **startup** | CH 已启动,等 launch hello | startup.memory | 等 launch protocol hello |
-| **restoring** | CH /vm.restore + /vm.resume 完成,等 restore_ack | allocatable_at_snapshot 或降级值 | 发 `restore{epoch}` 等 `restore_ack`(该连接随后升级为新 stdio MUX) |
+| **restoring** | CH `--restore resume=true` 完成(等 `vm/restored`),等 restore_ack | allocatable_at_snapshot 或降级值 | 发 `restore{epoch}` 等 `restore_ack`(该连接随后升级为新 stdio MUX) |
 | **settled** | hello 收到 / restore_ack 收到 | 渐缩到 floor + 工作集余量 | 周期上报 RSS;发 Settled |
 | **burst** | 检测到压力 | 申请扩展,可达 capacity | resize-balloon、改 memory.high |
 | **recover** | 压力消退 + 冷却 | 不主动收回,等被动回缩 | 继续上报 |
@@ -2189,7 +2190,7 @@ guest 内进程级压力(跨 host/guest 边界,接口复杂)。
 
 恢复路径与冷启动有两层差别:**(a)** sandbox.yaml 里大量字段在 restore 模式下
 有特殊语义(与 snapshot.cfg 合并、覆盖、断言式校验);**(b)** guest 在快照里
-**已有 in-memory 状态**(driver 缓冲、应用堆、page cache),`/vm.resume` 之后
+**已有 in-memory 状态**(driver 缓冲、应用堆、page cache),`vm/restored`(resume=true)之后
 cloud-hypervisor 按快照 page 索引把这些页 fault 回 guest 物理地址,host
 allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 

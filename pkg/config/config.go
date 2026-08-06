@@ -801,9 +801,9 @@ func (c *SandboxConfig) StartTimeoutDuration() time.Duration {
 // remote/cache or a paused debugger never aborts a restore); set positive
 // values (examples/timeouts-production.yaml) to fail fast in production.
 type TimeoutsConfig struct {
-	Restore  string `yaml:"restore,omitempty"`   // wait for guest restore_ack after /vm.resume
-	CHApi    string `yaml:"ch_api,omitempty"`    // CH HTTP API response (e.g. /vm.resume); dial stays bounded
-	APIReady string `yaml:"api_ready,omitempty"` // wait for CH API socket to accept after spawn
+	Restore  string `yaml:"restore,omitempty"`   // wait for guest restore_ack after the vm/restored barrier
+	CHApi    string `yaml:"ch_api,omitempty"`    // CH HTTP API response (e.g. /vm.snapshot); dial stays bounded
+	APIReady string `yaml:"api_ready,omitempty"` // post-spawn CH restore-readiness: wait for the vm/restored event
 	VAReport string `yaml:"va_report,omitempty"` // CH→host uffd-fd handoff handshake
 	// Ping is the host→guest ping round-trip deadline. Default no-forced means
 	// a guest whose vCPU is briefly blocked on a slow page-in still answers

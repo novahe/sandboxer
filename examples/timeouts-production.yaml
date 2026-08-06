@@ -20,15 +20,15 @@
 # set those there. The `snapshot` subcommand has its own `--timeout`.
 
 timeouts:
-  # Host wait for the guest's restore_ack after /vm.resume. Must exceed the
-  # worst-case "resume + fault in the working set" time for your images.
+  # Host wait for the guest's restore_ack after the vm/restored barrier. Must
+  # exceed the worst-case "resume + fault in the working set" time for your images.
   restore: 60s
 
-  # cloud-hypervisor HTTP API single-response deadline (e.g. /vm.resume). The
+  # cloud-hypervisor HTTP API single-response deadline (e.g. /vm.snapshot). The
   # dial stays bounded (5s) regardless; this bounds a slow RESPONSE.
   ch_api: 60s
 
-  # Poll wait for the CH API socket to start accepting after CH is spawned.
+  # Wait for the vm/restored event (CH restore-readiness) after CH is spawned.
   api_ready: 30s
 
   # CH→host uffd-fd handoff handshake (va_report). CH issues this early in
