@@ -4,24 +4,26 @@
 
 ### 1.1 背景与核心痛点
 
-传统轻量级虚拟机在快照恢复与高密部署下主要面临两大核心痛点：
+当前沙箱启动与高密部署面临两大核心痛点：
 
-1. **启动与恢复耗时线性增长**：缺乏按需加载机制时，系统需预先全量装载 rootfs 镜像与内存快照，导致容器拉起耗时与本地存储开销随工件体积线性膨胀。
+1. **启动与恢复耗时较久**：冷启动因 Guest 内核及系统初始化导致耗时较长，引入快照恢复可跳过该过程；然而传统恢复需预先全量装载镜像与内存快照，导致沙箱拉起耗时与本地存储开销随体积线性增长。
 2. **Guest 内存感知黑盒与动态回收难题**：Guest 操作系统独立管理其逻辑物理地址空间，宿主机侧无法直接感知或回收虚机内部的空闲物理页，极大限制了单机纳管密度与物理内存超分能力。
 
 ### 1.2 核心思想
 
-针对上述痛点，Sandboxer 提出了两条核心机制：
+针对上述痛点，Sandboxer 提出了三条核心机制：
 
+- **快照恢复（Snapshot Restore）**：跳过 Guest 内核与系统初始化过程，极速拉起沙箱。
 - **按需懒加载（Lazy Load）**：仅在发生内存缺页或磁盘读未命中时按需拉取数据。
 - **动态内存超分（Dynamic Overcommit）**：通过 Guest OS 与 Host OS 协同，在运行期根据实际情况按需调节物理内存占用。
 
 ### 1.3 设计目标
 
-1. **按需懒加载**：恢复与启动阶段无需预装载全量内存快照与 rootfs 镜像，按需拉取数据，大幅降低拉起耗时与存储开销。
-2. **分层快照**：仅保存增量数据与稀疏工作集，通过父子快照引用完成完整状态重构，最大化减少物理存储空间。
-3. **高效共享内存**：建立统一的内存共享平面，支持多组件对虚机内存物理映射的高效协同访问。
-4. **弹性高密部署**：结合宿主机与虚机内部的动态压力感知，实现平滑、安全的物理内存超分与资源回收。
+1. **极速快照恢复**：跳过 Guest 内核与系统初始化过程，实现毫秒级沙箱拉起。
+2. **按需懒加载**：恢复与启动阶段无需预装载全量内存快照与 rootfs 镜像，按需拉取数据，大幅降低拉起耗时与存储开销。
+3. **分层快照**：仅保存增量数据与稀疏工作集，通过父子快照引用完成完整状态重构，最大化减少物理存储空间。
+4. **高效共享内存**：建立统一的内存共享平面，支持多组件对虚机内存物理映射的高效协同访问。
+5. **弹性高密部署**：结合宿主机与虚机内部的动态压力感知，实现平滑、安全的物理内存超分与资源回收。
 
 ### 1.4 四项内核与虚拟化能力分工
 
@@ -156,7 +158,7 @@ sequenceDiagram
 #### 1. Balloon 设备（Guest 侧）
 根据物理配额调节可用内存：
 - **算式**：`balloon_target ≈ capacity - allocatable_now`
-- **机制**：**充气（Inflate）** 强迫 Guest 回收空闲物理页；**放气（Deflate）** 释放内存应对业务高峰。
+- **机制**：**充气（Inflate）** 强迫 Guest 回收空闲物理页；**放气（Deflate）** 释放内存应对业务高峰；支持 `deflate_on_oom`（Guest 内存紧张时自动归还已充气页）。
 
 #### 2. cgroup v2 水位线（Host 侧）
 - **`memory.high`（软限制）**：初始设为 `allocatable * 0.875`，跟随 `allocatable_now` 动态同比例更新。触及后触发内核主动回收与分配节流（Throttling），作为平抑突发分配的缓冲线。
@@ -170,7 +172,7 @@ memory.max  (Host 外) ==> 宿主机硬限制，守住全局物理安全红线
 
 ### 4.2 三层联动控制逻辑
 
-控制机制由三条异步并行路径协同驱动：
+沙箱创建/恢复阶段由 `node-ctl` 进行节点级准入拦截（`Admit`），通过后由三条异步并行路径协同驱动运行期控制：
 1. **Guest 反馈环**：基于周期性 `mem_report` 上报微调 Balloon 目标（不改变 `allocatable_now`）。
 2. **Host 压力环**：感知 PSI / `memory.events` 后向 `node-ctl` 申请追加配额；若获批则同步更新 `memory.high` 与 Balloon。
 3. **平台心跳环**：`node-ctl` 通过 Heartbeat 评估全局算力并更新权威 `allocatable_now`。
@@ -192,18 +194,23 @@ sequenceDiagram
     participant NodeCtl as node-ctl Resource Controller
     end
 
-    Note over NodeCtl: 计算初始 allocatable_now = max(Startup, Floor)
-    NodeCtl-->>SCT: 返回初始 allocatable_now
-    SCT->>CG: 设置 memory.high
-    SCT->>CH: PUT /vm.resize
-    CH->>Guest: 应用 Balloon 目标
+    SCT->>NodeCtl: Admit 准入申请
+    alt 节点拦截创建
+        NodeCtl-->>SCT: status=rejected (拦截创建)
+    else 准入通过
+        Note over NodeCtl: 计算初始 allocatable_now = max(Startup, Floor)
+        NodeCtl-->>SCT: 返回初始 allocatable_now
+        SCT->>CG: 设置 memory.high
+        SCT->>CH: PUT /vm.resize
+        CH->>Guest: 应用 Balloon 目标
+    end
 
     rect rgb(232, 241, 255)
         Note over Guest,CH: 1. Guest 反馈循环
         loop 周期性 mem_report
             Guest->>SCT: 上报 MemAvailable / MemTotal
             SCT->>CH: PUT /vm.resize (带步长限制)
-            CH->>Guest: Balloon 充气或放气
+            CH->>Guest: Balloon 充气或放气 (或 deflate_on_oom 自动归还)
         end
     end
 
@@ -241,7 +248,7 @@ sequenceDiagram
 ### 4.3 突发高内存降级防线
 
 ```text
-Guest 业务突发物理内存申请
+Guest 业务突发物理内存申请 (内存紧张触发 deflate_on_oom 自动归还)
     ↓
 宿主机 cgroup 物理用量上升触及 memory.high
     ↓
