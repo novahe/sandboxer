@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +26,10 @@ type readinessFDWriter struct {
 	ready        bool
 	closed       bool
 	loggedError  bool
+	timing       *sandbox.ReadinessTiming
 }
 
-func newReadinessFDWriter(fd int, logf func(string, ...any)) (*readinessFDWriter, error) {
+func newReadinessFDWriter(fd int, logf func(string, ...any), timing ...*sandbox.ReadinessTiming) (*readinessFDWriter, error) {
 	if fd < 3 {
 		return nil, fmt.Errorf("--ready-fd must be at least 3, got %d", fd)
 	}
@@ -48,7 +50,11 @@ func newReadinessFDWriter(fd int, logf func(string, ...any)) (*readinessFDWriter
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &readinessFDWriter{w: f, logf: logf}, nil
+	var t *sandbox.ReadinessTiming
+	if len(timing) > 0 {
+		t = timing[0]
+	}
+	return &readinessFDWriter{w: f, logf: logf, timing: t}, nil
 }
 
 func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
@@ -81,7 +87,7 @@ func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
 			_ = w.closeLocked()
 			return
 		}
-		if err := w.writeLineLocked(event); err != nil {
+		if err := w.writeReadyLocked(); err != nil {
 			w.failLocked("write ready", err)
 			return
 		}
@@ -96,6 +102,20 @@ func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
 
 func (w *readinessFDWriter) writeLineLocked(event sandbox.ReadinessEvent) error {
 	return wireio.WriteAll(w.w, []byte(string(event)+"\n"))
+}
+
+func (w *readinessFDWriter) writeReadyLocked() error {
+	if w.timing == nil {
+		return w.writeLineLocked(sandbox.ReadinessReady)
+	}
+	b, err := json.Marshal(w.timing)
+	if err != nil {
+		return err
+	}
+	if w.logf != nil {
+		w.logf("readiness timing: %s", b)
+	}
+	return wireio.WriteAll(w.w, append(append([]byte("ready\t"), b...), '\n'))
 }
 
 func (w *readinessFDWriter) failLocked(op string, err error) {

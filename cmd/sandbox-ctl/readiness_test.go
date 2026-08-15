@@ -242,3 +242,31 @@ func TestReadinessFDWriterUsesFullWriteLoop(t *testing.T) {
 		t.Fatalf("readiness wire = %q, want %q", got, want)
 	}
 }
+
+func TestReadinessFDWriterTimingPayload(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	readyFD := transferReadinessFD(t, w)
+	timing := &sandbox.ReadinessTiming{
+		Version: 1, SandboxCtlStartUnixNs: 100, CHStartUnixNs: 200,
+		CHResumeDoneUnixNs: 300, SandboxInitAckUnixNs: 400,
+	}
+	n, err := newReadinessFDWriter(readyFD, nil, timing)
+	if err != nil {
+		_ = unix.Close(readyFD)
+		t.Fatal(err)
+	}
+	n.Notify(sandbox.ReadinessControlReady)
+	n.Notify(sandbox.ReadinessReady)
+	body, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "control_ready\nready\t{\"version\":1,\"sandbox_ctl_start_unix_ns\":100,\"ch_start_unix_ns\":200,\"ch_resume_done_unix_ns\":300,\"sandbox_init_ack_unix_ns\":400}\n"
+	if string(body) != want {
+		t.Fatalf("readiness wire = %q, want %q", body, want)
+	}
+}

@@ -100,12 +100,19 @@ func runCmd(args []string) int {
 			readyFDSet = true
 		}
 	})
+	var readinessTiming *sandbox.ReadinessTiming
+	if readyFDSet {
+		readinessTiming = &sandbox.ReadinessTiming{
+			Version:               1,
+			SandboxCtlStartUnixNs: time.Now().UnixNano(),
+		}
+	}
 	var readiness *readinessFDWriter
 	if readyFDSet {
 		var err error
 		readiness, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
 			log.Printf("[sandbox-ctl] "+format, args...)
-		})
+		}, readinessTiming)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
 			return 2
@@ -274,7 +281,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
 			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, readinessTiming)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
@@ -295,6 +302,7 @@ func runCmd(args []string) int {
 		PingFatalThreshold: *pingFatal,
 		Forwards:           forwards,
 		NotifyReadiness:    notifyReadiness,
+		ReadinessTiming:    readinessTiming,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -308,8 +316,12 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify,
+	notifyReadiness sandbox.ReadinessNotify, readinessTimings ...*sandbox.ReadinessTiming,
 ) int {
+	var readinessTiming *sandbox.ReadinessTiming
+	if len(readinessTimings) > 0 {
+		readinessTiming = readinessTimings[0]
+	}
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
 	// but the CLI owns NewFetcher and must not dial for an invalid config.
@@ -372,6 +384,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		PingFatalThreshold:  pingFatal,
 		Forwards:            forwards,
 		NotifyReadiness:     notifyReadiness,
+		ReadinessTiming:     readinessTiming,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

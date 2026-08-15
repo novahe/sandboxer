@@ -64,6 +64,9 @@ type RunOptions struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness ReadinessNotify
+	// ReadinessTiming carries sandbox-ctl/CH/restore points to the readiness
+	// bridge. nil preserves the historical plain readiness wire.
+	ReadinessTiming *ReadinessTiming
 }
 
 // Run executes one sandbox lifecycle: prepare backends + launch server,
@@ -458,6 +461,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		Forwards:          opts.Forwards,
 		Cgroup:            cg,
 		NotifyReadiness:   opts.NotifyReadiness,
+		ReadinessTiming:   opts.ReadinessTiming,
 		ReadyOnAppStarted: true,
 
 		BuildCmd: func(e CmdEnv) (*exec.Cmd, func(), error) {
