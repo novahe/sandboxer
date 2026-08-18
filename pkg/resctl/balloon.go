@@ -84,19 +84,6 @@ type BalloonController struct {
 	// a kick can fire immediately.
 	lastReconcileAt atomic.Int64
 
-	// checkpointHold gates every non-checkpoint writer (Hint, loop reconcile,
-	// ApplyAllocatable) while a working-set snapshot (drop_caches=false) is
-	// being captured. The balloon is deflated first so the guest can keep
-	// file pages resident into the snapshot; heartbeat/reclaimer targets
-	// would re-inflate mid-capture and evict them (issue #114).
-	checkpointHold atomic.Bool
-	// holdOwnerResize lets DeflateForCheckpoint's own resize pass the gate
-	// the hold itself raised (set only for the synchronous deflate call).
-	holdOwnerResize atomic.Bool
-	// allocAfterHold restores the controller-budget target once the capture
-	// finishes (build flows resume the sandbox to record the next layer).
-	allocAfterHold atomic.Uint64
-
 	startOnce sync.Once
 	stopOnce  sync.Once
 	stopCh    chan struct{}
@@ -169,57 +156,6 @@ func (b *BalloonController) SetTarget(sizeBytes uint64) {
 // matches the value baked into CH's --balloon arg or the snapshot.
 func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 	b.SetTarget(b.targetForAllocatable(allocBytes))
-}
-
-// DeflateForCheckpoint quiesces the balloon for a working-set capture
-// (drop_caches=false): synchronously deflate the target to zero — the
-// device stays attached but holds no pages, so the guest's whole working
-// set (file-page cache included) stays resident into the snapshot. Other
-// writers (Hint, heartbeat/reclaimer ApplyAllocatable, loop reconcile)
-// are gated until RestoreAfterCheckpoint; the pre-hold target is
-// remembered there. `settle` waits after the deflate for the guest
-// driver to hand the pages back before the caller freezes the VM.
-//
-// CH records target 0 into the snapshot; restore's
-// deriveAllocatableAtSnapshot then yields allocatable = capacity, i.e.
-// the relaxed post-restore start (matching a balloon-free build) before
-// the controller settles back to the floor.
-func (b *BalloonController) DeflateForCheckpoint(ctx context.Context, settle time.Duration) error {
-	b.defaults()
-	target := uint64(0)
-	b.allocAfterHold.Store(b.target.Load())
-	b.checkpointHold.Store(true) // gate other writers before we touch CH
-	b.Logf("balloon: checkpoint deflate → %d MiB (pre-hold target %d MiB), settle %s",
-		target>>20, b.allocAfterHold.Load()>>20, settle)
-	b.holdOwnerResize.Store(true) // exempt our own deflate from the gate
-	err := b.applyTargetLocked(ctx, target)
-	b.holdOwnerResize.Store(false)
-	if err != nil {
-		b.Logf("balloon: checkpoint deflate resize: %v", err)
-		return err
-	}
-	if settle > 0 {
-		select {
-		case <-ctx.Done():
-		case <-time.After(settle):
-		}
-	}
-	return nil
-}
-
-// RestoreAfterCheckpoint ends a capture window: other writers resume and
-// the remembered pre-hold target returns for the loop to reconcile.
-func (b *BalloonController) RestoreAfterCheckpoint() {
-	if !b.checkpointHold.CompareAndSwap(true, false) {
-		return
-	}
-	prev := b.allocAfterHold.Swap(0)
-	b.target.Store(prev)
-	select {
-	case b.kick <- struct{}{}:
-	default:
-	}
-	b.Logf("balloon: checkpoint window closed — target restored to %d MiB", prev>>20)
 }
 
 // ApplyAllocatable synchronously commits an allocatable change to Cloud
@@ -513,15 +449,6 @@ func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64
 }
 
 func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) error {
-	if b.checkpointHold.Load() && !b.holdOwnerResize.Load() {
-		// Working-set capture window: resizes from heartbeat settle,
-		// reclaimer targets, or grants would re-inflate mid-capture and
-		// evict the file pages the capture is preserving. Skip them;
-		// applyTargetLocked still records the size as actual, so the next
-		// reconcile after RestoreAfterCheckpoint converges CH.
-		b.Logf("balloon: resize to %d MiB skipped — checkpoint freeze active", sizeBytes>>20)
-		return nil
-	}
 	body, err := json.Marshal(struct {
 		DesiredBalloon uint64 `json:"desired_balloon"`
 	}{DesiredBalloon: sizeBytes})

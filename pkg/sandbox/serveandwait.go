@@ -456,7 +456,6 @@ func ServeAndWait(p VMParams) (int, error) {
 		Pinger:        pinger,
 		Forwarder:     forwarder,
 		Reattach:      reattach,
-		Balloon:       p.Balloon,
 		Logf:          logf,
 	}
 	ctlSrv := &ctl.Server{
@@ -606,16 +605,16 @@ func ServeAndWait(p VMParams) (int, error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:             p.Ctx,
-		Cmd:             cmd,
-		Pinger:          pinger,
-		Launch:          launch,
-		EstablishMUX:    establishMUX,
-		Hooks:           p.Hooks,
-		Balloon:         p.Balloon,
-		CHSock:          chSock,
-		Logf:            logf,
-		NotifyReady:     readiness.notifyReady,
+		Ctx:          p.Ctx,
+		Cmd:          cmd,
+		Pinger:       pinger,
+		Launch:       launch,
+		EstablishMUX: establishMUX,
+		Hooks:        p.Hooks,
+		Balloon:      p.Balloon,
+		CHSock:       chSock,
+		Logf:         logf,
+		NotifyReady:  readiness.notifyReady,
 		ReadinessTiming: p.ReadinessTiming,
 	}); err != nil {
 		if !runShutdownRequested(p.Ctx) {

@@ -827,10 +827,9 @@ type SnapshotHandler struct {
 	Servers       []*vhost.Server // all vhost servers (quiesced together around the dump)
 	CHSock        string
 	RunDir        string
-	Pinger        *guestlink.Pinger         // optional; if non-nil, paused around quiesce/Take
-	Forwarder     *Forwarder                // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach      func() error              // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
-	Balloon       *resctl.BalloonController // optional; resizes frozen during working-set captures (drop_caches=false)
+	Pinger        *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
+	Forwarder     *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach      func() error      // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
 	Logf          func(string, ...any)
 }
 
@@ -840,7 +839,7 @@ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
-	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Balloon, h.Logf)
+	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
 }
 
 // handleSnapshotRequest executes one snapshot_request received via
@@ -858,24 +857,9 @@ func handleSnapshotRequest(
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
-	balloon *resctl.BalloonController, // optional; resizes frozen while capturing a working set
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
 	dropCaches := req.DropCachesEnabled()
-	// Working-set capture (drop_caches=false): deflate the balloon to zero
-	// and gate every other resize for the capture window so the guest's
-	// file-page cache stays resident into the snapshot (issue #114). The
-	// deflate is asynchronous in CH — the guest driver hands pages back
-	// gradually — so settle before quiescing; 12 s proved enough for the
-	// driver to fully return a ~7 GiB balloon. After export,
-	// RestoreAfterCheckpoint (deferred) re-enables writers and the loop
-	// re-converges to the controller's target on its next tick.
-	if !dropCaches && balloon != nil {
-		if err := balloon.DeflateForCheckpoint(context.Background(), 12*time.Second); err != nil {
-			logf("snapshot: balloon deflate for capture failed (continuing): %v", err)
-		}
-		defer balloon.RestoreAfterCheckpoint()
-	}
 	mergeRef := req.MergeRefEnabled()
 	prov := opts.Cfg.SnapshotProvenance
 	localParent := false

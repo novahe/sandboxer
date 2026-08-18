@@ -214,7 +214,7 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), pinger, nil, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "direct upload would retain a local memory lower") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
@@ -232,13 +232,13 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
 
 	_, err := handleSnapshotRequest(ctl.Request{}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), pinger, nil, nil, nil, discardLogf)
+		"", t.TempDir(), pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
 
 	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), pinger, nil, nil, nil, discardLogf)
+		"", t.TempDir(), pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("missing manifest config error = %v", err)
 	}
@@ -270,7 +270,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 				return bytes.NewReader(make([]byte, 4096)), nil, nil
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
-		pinger, nil, nil, nil, discardLogf)
+		pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
@@ -299,7 +299,7 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), nil, nil, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "customer key") {
 		t.Fatalf("upload key error = %v", err)
 	}
@@ -411,7 +411,6 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 			reattachedAfterResume = true
 			return nil
 		},
-		nil,
 		discardLogf,
 	)
 	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
