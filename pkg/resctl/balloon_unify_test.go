@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -807,6 +808,185 @@ func TestApplyAllocatableOverridesCompetingHintTarget(t *testing.T) {
 	defer srv.mu.Unlock()
 	if len(srv.calls) == 0 || srv.calls[len(srv.calls)-1] != want {
 		t.Fatalf("resize calls = %v, want final %d", srv.calls, want)
+	}
+}
+
+func TestBalloon_WithCheckpointRestoresLatestTargetAndSerializesResize(t *testing.T) {
+	srv := newFakeCHResize(t)
+	const capacity = uint64(1 << 30)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	const initialAlloc = uint64(256 << 20)
+	const latestAlloc = uint64(512 << 20)
+	b.SeedAppliedAllocatable(initialAlloc)
+
+	captureStarted := make(chan struct{})
+	releaseCapture := make(chan struct{})
+	checkpointDone := make(chan error, 1)
+	go func() {
+		checkpointDone <- b.WithCheckpoint(context.Background(), 0, func() error {
+			if got := srv.currentSize(); got != 0 {
+				return fmt.Errorf("capture started with balloon=%d, want 0", got)
+			}
+			close(captureStarted)
+			<-releaseCapture
+			return nil
+		})
+	}()
+	select {
+	case <-captureStarted:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint did not reach capture")
+	}
+
+	// Publishing a new target during the capture must affect the restore; it
+	// must not be overwritten by the target that existed at checkpoint start.
+	b.SetAllocatable(latestAlloc)
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- b.Reconcile(context.Background()) }()
+	select {
+	case err := <-reconcileDone:
+		t.Fatalf("reconcile completed while checkpoint held gate: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseCapture)
+	if err := <-checkpointDone; err != nil {
+		t.Fatalf("WithCheckpoint: %v", err)
+	}
+	if err := <-reconcileDone; err != nil {
+		t.Fatalf("queued Reconcile: %v", err)
+	}
+
+	want := capacity - latestAlloc
+	if got := b.CurrentTarget(); got != want {
+		t.Fatalf("target after checkpoint = %d, want %d", got, want)
+	}
+	if got := b.CurrentActual(); got != want {
+		t.Fatalf("actual after checkpoint = %d, want %d", got, want)
+	}
+	calls := srv.seen()
+	if len(calls) != 2 || calls[0] != 0 || calls[1] != want {
+		t.Fatalf("serialized checkpoint resize calls = %v, want [0 %d]", calls, want)
+	}
+}
+
+func TestBalloon_WithCheckpointCancellationRestoresAndSkipsCapture(t *testing.T) {
+	srv := newFakeCHResize(t)
+	const capacity = uint64(1 << 30)
+	const allocatable = uint64(256 << 20)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(allocatable)
+	srv.setCurrent(capacity - allocatable)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	captureCalled := atomic.Bool{}
+	done := make(chan error, 1)
+	go func() {
+		done <- b.WithCheckpoint(ctx, time.Hour, func() error {
+			captureCalled.Store(true)
+			return nil
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for srv.currentSize() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := srv.currentSize(); got != 0 {
+		t.Fatalf("checkpoint did not deflate before cancellation: balloon=%d", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("WithCheckpoint error = %v, want context.Canceled", err)
+	}
+	if captureCalled.Load() {
+		t.Fatal("capture ran after settle cancellation")
+	}
+	want := capacity - allocatable
+	if got := srv.currentSize(); got != want {
+		t.Fatalf("balloon after cancelled checkpoint = %d, want %d", got, want)
+	}
+	if calls := srv.seen(); len(calls) != 2 || calls[0] != 0 || calls[1] != want {
+		t.Fatalf("cancelled checkpoint resize calls = %v, want [0 %d]", calls, want)
+	}
+}
+
+func TestBalloon_ApplyAllocatableWaitsForCheckpoint(t *testing.T) {
+	srv := newFakeCHResize(t)
+	const capacity = uint64(1 << 30)
+	const initialAlloc = uint64(256 << 20)
+	const latestAlloc = uint64(512 << 20)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(initialAlloc)
+	srv.setCurrent(capacity - initialAlloc)
+
+	captureStarted := make(chan struct{})
+	releaseCapture := make(chan struct{})
+	checkpointDone := make(chan error, 1)
+	go func() {
+		checkpointDone <- b.WithCheckpoint(context.Background(), 0, func() error {
+			close(captureStarted)
+			<-releaseCapture
+			return nil
+		})
+	}()
+	select {
+	case <-captureStarted:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint did not reach capture")
+	}
+
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- b.ApplyAllocatable(context.Background(), latestAlloc) }()
+	select {
+	case err := <-applyDone:
+		t.Fatalf("ApplyAllocatable completed while checkpoint held gate: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseCapture)
+	if err := <-checkpointDone; err != nil {
+		t.Fatalf("WithCheckpoint: %v", err)
+	}
+	if err := <-applyDone; err != nil {
+		t.Fatalf("ApplyAllocatable: %v", err)
+	}
+
+	want := capacity - latestAlloc
+	if got := b.CurrentActual(); got != want {
+		t.Fatalf("actual after queued ApplyAllocatable = %d, want %d", got, want)
+	}
+	if calls := srv.seen(); len(calls) != 3 || calls[0] != 0 || calls[1] != capacity-initialAlloc || calls[2] != want {
+		t.Fatalf("queued ApplyAllocatable resize calls = %v, want [0 %d %d]", calls, capacity-initialAlloc, want)
+	}
+}
+
+func TestBalloon_WithCheckpointDeflateFailureForcesRestore(t *testing.T) {
+	srv := newFakeCHResize(t)
+	const capacity = uint64(1 << 30)
+	const allocatable = uint64(256 << 20)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(allocatable)
+	srv.failNext(1)
+	captureCalled := false
+	err := b.WithCheckpoint(context.Background(), 0, func() error {
+		captureCalled = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "checkpoint deflate") {
+		t.Fatalf("WithCheckpoint error = %v, want deflate failure", err)
+	}
+	if captureCalled {
+		t.Fatal("capture ran after deflate failure")
+	}
+	want := capacity - allocatable
+	if got := srv.currentSize(); got != want {
+		t.Fatalf("balloon after failed deflate = %d, want %d", got, want)
+	}
+	if got := b.CurrentActual(); got != want {
+		t.Fatalf("actual after failed deflate = %d, want %d", got, want)
+	}
+	if calls := srv.seen(); len(calls) != 2 || calls[0] != 0 || calls[1] != want {
+		t.Fatalf("failed checkpoint resize calls = %v, want [0 %d]", calls, want)
 	}
 }
 

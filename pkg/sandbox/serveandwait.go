@@ -118,9 +118,10 @@ type VMParams struct {
 	// AppNotifyDeadline bounds the host read of one guest→host launch-port
 	// message (hello / app_started / app_exited / mem_report); 0 = no forced
 	// timeout. From cfg.AppNotifyDeadline().
-	AppNotifyDeadline time.Duration
-	Balloon           *resctl.BalloonController
-	Hooks             *resctl.ControllerHooks
+	AppNotifyDeadline       time.Duration
+	Balloon                 *resctl.BalloonController
+	BalloonCheckpointSettle time.Duration // 0 uses defaultBalloonCheckpointSettle
+	Hooks                   *resctl.ControllerHooks
 
 	// TapFile, when non-nil, is a tap queue fd acquired via the tapfd handoff
 	// (docs/tapfd.md). ServeAndWait inherits it into CH after the memfd (CH
@@ -440,21 +441,24 @@ func ServeAndWait(p VMParams) (int, error) {
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
 	snapHandler := &SnapshotHandler{
-		Cfg:           p.SnapCfg,
-		ManifestCfg:   p.ManifestCfg,
-		CustomerKeyFn: p.CustomerKeyFn,
-		LocalCodec:    p.LocalCodec,
-		LocalRequired: p.LocalRequired,
-		SandboxID:     p.SandboxID,
-		Memfd:         memfd,
-		Disks:         snapDisks,
-		Servers:       servers,
-		CHSock:        chSock,
-		RunDir:        runDir,
-		Pinger:        pinger,
-		Forwarder:     forwarder,
-		Reattach:      reattach,
-		Logf:          logf,
+		Cfg:                     p.SnapCfg,
+		ManifestCfg:             p.ManifestCfg,
+		CustomerKeyFn:           p.CustomerKeyFn,
+		LocalCodec:              p.LocalCodec,
+		LocalRequired:           p.LocalRequired,
+		SandboxID:               p.SandboxID,
+		Memfd:                   memfd,
+		Disks:                   snapDisks,
+		Servers:                 servers,
+		CHSock:                  chSock,
+		RunDir:                  runDir,
+		Pinger:                  pinger,
+		Forwarder:               forwarder,
+		Reattach:                reattach,
+		Logf:                    logf,
+		SnapshotContext:         backendCtx,
+		Balloon:                 p.Balloon,
+		BalloonCheckpointSettle: p.BalloonCheckpointSettle,
 	}
 	ctlSrv := &ctl.Server{
 		Path:            ctlSockPath,
