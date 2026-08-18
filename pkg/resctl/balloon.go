@@ -71,6 +71,12 @@ type BalloonController struct {
 	target      atomic.Uint64 // desired balloon size in bytes
 	actual      atomic.Uint64 // last successfully applied size
 	reconcileMu sync.Mutex
+	// checkpointGate serializes every operation that can issue vm.resize.
+	// A working-set checkpoint holds it from the temporary deflate through
+	// snapshot capture and the final restore to the latest desired target.
+	// SetTarget/Hint do not need the gate: they only publish desired state.
+	checkpointGate     chan struct{}
+	checkpointGateOnce sync.Once
 
 	// kick is a non-blocking signal channel: SetTarget (and therefore
 	// SetAllocatable, which wraps SetTarget) pokes it on every write.
@@ -99,16 +105,26 @@ func NewBalloonController(chSock string, capacity uint64, logf func(string, ...a
 			return net.Dial("unix", chSock)
 		},
 	}
-	return &BalloonController{
+	b := &BalloonController{
 		Capacity: capacity,
 		Logf:     logf,
 		chSock:   chSock,
 		client:   &http.Client{Transport: tr, Timeout: 3 * time.Second},
 		kick:     make(chan struct{}, 1),
 	}
+	b.initCheckpointGate()
+	return b
+}
+
+func (b *BalloonController) initCheckpointGate() {
+	b.checkpointGateOnce.Do(func() {
+		b.checkpointGate = make(chan struct{}, 1)
+		b.checkpointGate <- struct{}{}
+	})
 }
 
 func (b *BalloonController) defaults() {
+	b.initCheckpointGate()
 	if b.Interval <= 0 {
 		b.Interval = 5 * time.Second
 	}
@@ -158,9 +174,104 @@ func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 	b.SetTarget(b.targetForAllocatable(allocBytes))
 }
 
+// WithCheckpoint runs a working-set snapshot while the balloon is temporarily
+// deflated. The gate is held across the callback, so no reconcile or resource
+// allocation can issue a competing vm.resize. SetTarget/Hint may still publish
+// a newer desired target; it is applied before the gate is released.
+//
+// The callback is not invoked when the temporary deflate or settle is
+// cancelled/fails. A cleanup resize is attempted with a cancellation-free
+// context because leaving the VM at balloon=0 is worse than failing the
+// snapshot request. The caller must pass a callback that performs the actual
+// snapshot while the guest is still running or quiesced as appropriate.
+func (b *BalloonController) WithCheckpoint(ctx context.Context, settle time.Duration, capture func() error) (checkpointErr error) {
+	b.defaults()
+	if capture == nil {
+		return errors.New("balloon: checkpoint capture callback is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := b.acquireCheckpointGate(ctx); err != nil {
+		return fmt.Errorf("balloon: begin checkpoint: %w", err)
+	}
+	defer b.releaseCheckpointGate()
+
+	b.reconcileMu.Lock()
+	wasInflated := b.actual.Load() != 0
+	deflateErr := b.applyTargetLocked(ctx, 0)
+	b.reconcileMu.Unlock()
+	if deflateErr != nil {
+		restoreErr := b.restoreCheckpointTarget(ctx, true)
+		if restoreErr != nil {
+			return errors.Join(
+				fmt.Errorf("balloon: checkpoint deflate: %w", deflateErr),
+				fmt.Errorf("balloon: restore target after failed deflate: %w", restoreErr),
+			)
+		}
+		return fmt.Errorf("balloon: checkpoint deflate: %w", deflateErr)
+	}
+	defer func() {
+		if restoreErr := b.restoreCheckpointTarget(ctx, false); restoreErr != nil {
+			checkpointErr = errors.Join(checkpointErr,
+				fmt.Errorf("balloon: restore target after checkpoint: %w", restoreErr))
+		}
+	}()
+
+	if wasInflated && settle > 0 {
+		timer := time.NewTimer(settle)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	return capture()
+}
+
+func (b *BalloonController) acquireCheckpointGate(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-b.checkpointGate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *BalloonController) releaseCheckpointGate() {
+	b.checkpointGate <- struct{}{}
+}
+
+func (b *BalloonController) restoreCheckpointTarget(ctx context.Context, force bool) error {
+	// A cancelled snapshot context must not prevent the cleanup resize. The
+	// HTTP client still supplies its own finite request timeout.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+	return b.applyTargetLockedMode(ctx, b.target.Load(), force)
+}
+
 // ApplyAllocatable synchronously commits an allocatable change to Cloud
 // Hypervisor. ControllerHooks uses it inside the serialized resource session
-// and advances appliedAllocatable only after this returns successfully.
+// and advances appliedAllocatable only after this returns successfully. A
+// concurrent working-set checkpoint is waited out (or cancelled through ctx)
+// rather than being reported as a successful no-op.
 func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
 	return b.applyAllocatable(ctx, allocBytes, false)
 }
@@ -174,6 +285,10 @@ func (b *BalloonController) ApplyAllocatableEventually(ctx context.Context, allo
 
 func (b *BalloonController) applyAllocatable(ctx context.Context, allocBytes uint64, retainOnFailure bool) error {
 	b.defaults()
+	if err := b.acquireCheckpointGate(ctx); err != nil {
+		return err
+	}
+	defer b.releaseCheckpointGate()
 	b.reconcileMu.Lock()
 	defer b.reconcileMu.Unlock()
 
@@ -426,6 +541,10 @@ func (b *BalloonController) loop(ctx context.Context) {
 // last applied value. Idempotent; safe to call concurrently with
 // SetTarget/Hint.
 func (b *BalloonController) Reconcile(ctx context.Context) error {
+	if err := b.acquireCheckpointGate(ctx); err != nil {
+		return err
+	}
+	defer b.releaseCheckpointGate()
 	b.reconcileMu.Lock()
 	defer b.reconcileMu.Unlock()
 	return b.applyTargetLocked(ctx, b.target.Load())
@@ -433,11 +552,15 @@ func (b *BalloonController) Reconcile(ctx context.Context) error {
 
 // applyTargetLocked applies exactly target. Caller holds reconcileMu.
 func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64) error {
+	return b.applyTargetLockedMode(ctx, target, false)
+}
+
+func (b *BalloonController) applyTargetLockedMode(ctx context.Context, target uint64, force bool) error {
 	// Record the attempt time regardless of whether a resize is actually
 	// needed: the kick-rate-limit only cares "did we recently look", not
 	// "did we recently change CH state".
 	defer b.lastReconcileAt.Store(time.Now().UnixNano())
-	if target == b.actual.Load() {
+	if !force && target == b.actual.Load() {
 		return nil
 	}
 	if err := b.callResize(ctx, target); err != nil {

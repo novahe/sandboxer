@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,10 +46,19 @@ type RunOptions struct {
 	BaseRoot      string                 // on-disk base root (overlay diff); "/var/lib/sandbox" by default
 	StatsJSONPath string                 // if set, write vhost stats as JSON to this path on shutdown
 	StatsInterval time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
-	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
-	CustomerKeyFn ingest.CustomerKeyFunc // process-fixed customer key resolver
-	LocalCodec    tarstream.Codec        // nil when crypto.local=off
-	LocalRequired bool                   // reject plaintext local artifacts and active diffs
+
+	// SnapshotContext bounds a snapshot's temporary working-set checkpoint
+	// to the owning VM lifecycle. It is normally backendCtx from ServeAndWait;
+	// nil is treated as context.Background for direct unit-test callers.
+	SnapshotContext context.Context
+	Balloon         *resctl.BalloonController
+	// BalloonCheckpointSettle is the delay after deflating the balloon and
+	// before capturing a working-set snapshot. 0 uses the runtime default.
+	BalloonCheckpointSettle time.Duration
+	StdioMode               stdio.Mode             // CH process stdio wiring; see pkg/stdio
+	CustomerKeyFn           ingest.CustomerKeyFunc // process-fixed customer key resolver
+	LocalCodec              tarstream.Codec        // nil when crypto.local=off
+	LocalRequired           bool                   // reject plaintext local artifacts and active diffs
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -440,14 +450,15 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		UffdSource: uffd.ZeroSource{},
 		Disks:      disks,
 
-		LaunchSpec:        launchSpec,
-		WireLaunchMUX:     true,
-		StartTimeout:      opts.Cfg.StartTimeoutDuration(),
-		VAReportDeadline:  opts.Cfg.VAReportDeadline(),
-		PingTimeout:       opts.Cfg.PingDeadline(),
-		AppNotifyDeadline: opts.Cfg.AppNotifyDeadline(),
-		Balloon:           balloonCtl,
-		Hooks:             hooks,
+		LaunchSpec:              launchSpec,
+		WireLaunchMUX:           true,
+		StartTimeout:            opts.Cfg.StartTimeoutDuration(),
+		VAReportDeadline:        opts.Cfg.VAReportDeadline(),
+		PingTimeout:             opts.Cfg.PingDeadline(),
+		AppNotifyDeadline:       opts.Cfg.AppNotifyDeadline(),
+		Balloon:                 balloonCtl,
+		BalloonCheckpointSettle: opts.BalloonCheckpointSettle,
+		Hooks:                   hooks,
 
 		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
@@ -816,28 +827,39 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	Cfg           *config.SandboxConfig
-	ManifestCfg   *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
-	CustomerKeyFn ingest.CustomerKeyFunc
-	LocalCodec    tarstream.Codec
-	LocalRequired bool
-	SandboxID     string // required: snapshot.Take rejects empty
-	Memfd         *memory.Memfd
-	Disks         []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers       []*vhost.Server // all vhost servers (quiesced together around the dump)
-	CHSock        string
-	RunDir        string
-	Pinger        *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
-	Forwarder     *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach      func() error      // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
-	Logf          func(string, ...any)
+	Cfg                     *config.SandboxConfig
+	ManifestCfg             *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+	CustomerKeyFn           ingest.CustomerKeyFunc
+	LocalCodec              tarstream.Codec
+	LocalRequired           bool
+	SandboxID               string // required: snapshot.Take rejects empty
+	Memfd                   *memory.Memfd
+	Disks                   []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+	Servers                 []*vhost.Server // all vhost servers (quiesced together around the dump)
+	CHSock                  string
+	RunDir                  string
+	Pinger                  *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
+	Forwarder               *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach                func() error      // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
+	Logf                    func(string, ...any)
+	SnapshotContext         context.Context
+	Balloon                 *resctl.BalloonController
+	BalloonCheckpointSettle time.Duration
+	snapshotMu              sync.Mutex
 }
+
+const defaultBalloonCheckpointSettle = 12 * time.Second
 
 // Handle dispatches one ctl snapshot_request. Public for restore.Run.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
+	h.snapshotMu.Lock()
+	defer h.snapshotMu.Unlock()
+
 	opts := RunOptions{
 		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
+		SnapshotContext: h.SnapshotContext, Balloon: h.Balloon,
+		BalloonCheckpointSettle: h.BalloonCheckpointSettle,
 	}
 	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
 }
@@ -1008,170 +1030,193 @@ func handleSnapshotRequest(
 		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 	}
 
-	dropCachesResult := proto.DropCachesUnknown
-	guestQuiesced := false
+	capture := func() (resp ctl.Response, err error) {
+		dropCachesResult := proto.DropCachesUnknown
+		guestQuiesced := false
 
-	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
-	// pause the ping ticker, then `quiesce` → the guest does sync +
-	// drop_caches, stops reading the app's stdout/stderr (pty), runs the
-	// graceful MUX_CLOSE handshake on the stdio MUX (the host's mux.Session
-	// auto-replies MUX_CLOSE_ACK), then replies `quiesced`. quiesced ⇒
-	// the MUX is closed + the app is blocked + the guest is in a clean
-	// state — safe to /vm.pause via snapshot.Take. Quiesce failure aborts
-	// this snapshot rather than capturing a half-open MUX; sandbox keeps
-	// running.
-	//
-	// On the --resume path, snapshot.Take resumes CH but the MUX stays
-	// closed; reattachMUX (below, after Take) `attach`es a fresh one so the
-	// running app's stdio flows again. On the destroy path (resume_after=
-	// false) we instead tear the VMM down once this response has flushed —
-	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2 T8).
-	defer func() {
-		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, opts.Cfg.CHApiDeadline(), logf)
+		// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
+		// pause the ping ticker, then `quiesce` → the guest does sync +
+		// drop_caches, stops reading the app's stdout/stderr (pty), runs the
+		// graceful MUX_CLOSE handshake on the stdio MUX (the host's mux.Session
+		// auto-replies MUX_CLOSE_ACK), then replies `quiesced`. quiesced ⇒
+		// the MUX is closed + the app is blocked + the guest is in a clean
+		// state — safe to /vm.pause via snapshot.Take. Quiesce failure aborts
+		// this snapshot rather than capturing a half-open MUX; sandbox keeps
+		// running.
+		//
+		// On the --resume path, snapshot.Take resumes CH but the MUX stays
+		// closed; reattachMUX (below, after Take) `attach`es a fresh one so the
+		// running app's stdio flows again. On the destroy path (resume_after=
+		// false) the VMM shutdown is scheduled only after the outer checkpoint
+		// callback has restored the balloon.
+		// Gate new port-forward connects and join every admitted handshake/relay
+		// before asking the guest to quiesce. The later `quiesced` response is then
+		// a barrier after both host and guest teardown, so no forward shutdown can
+		// race /vm.pause. Resume mirrors the pinger: stay paused only on the success
+		// + destroy path.
+		if forwarder != nil {
+			forwarder.PauseAndDrain()
+			defer func() {
+				if err == nil && !req.ResumeAfter {
+					return
+				}
+				forwarder.Resume()
+			}()
 		}
-	}()
-	// Gate new port-forward connects and join every admitted handshake/relay
-	// before asking the guest to quiesce. The later `quiesced` response is then
-	// a barrier after both host and guest teardown, so no forward shutdown can
-	// race /vm.pause. Resume mirrors the pinger: stay paused only on the success
-	// + destroy path.
-	if forwarder != nil {
-		forwarder.PauseAndDrain()
-		defer func() {
-			if err == nil && !req.ResumeAfter {
+		if pinger != nil {
+			pinger.Pause()
+			// Resume on the way out UNLESS this is the success + destroy
+			// path: there the VM stays paused while destroyAfterSnapshot
+			// tears it down, so a resumed pinger only spews misleading
+			// `ping ... i/o timeout` lines against a paused/dying VM. On
+			// error (sandbox keeps running) or --resume (sandbox resumed),
+			// the pinger must come back.
+			defer func() {
+				if err == nil && !req.ResumeAfter {
+					return
+				}
+				pinger.Resume()
+			}()
+			client := pinger.Client
+			if client == nil {
+				client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
+			}
+			result, qerr := guestlink.SendQuiesce(client, !dropCaches)
+			if qerr != nil {
+				err = qerr
+				logf("quiesce: %v (aborting snapshot)", err)
+				return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
+			}
+			dropCachesResult = result
+			guestQuiesced = true
+			logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
+		}
+
+		// Build snapshot.cfg builder closure. Take() invokes it with the final
+		// overlay_ref the sink produced (scheme-qualified file ref in --output mode,
+		// manifest://<key> in --upload mode) so snapshot.cfg's overlay.base is
+		// final on first write — no post-hoc ZIP rewrite.
+		cfg := opts.Cfg
+		snapCfgBuilder := func(overlayRefs []string) ([]byte, error) {
+			return buildSnapshotCfg(cfg, overlayRefs, resultMemoryRefs, diskMerged)
+		}
+
+		// opts.SandboxID is always populated by the run path (generated when the
+		// CLI didn't pass one); see Run() in this file.
+		sandboxID := opts.SandboxID
+
+		// Pick the sink. --output writes sparse, content-addressed local files;
+		// --upload streams to a fresh Ingester (its own store client, never shared
+		// with the long-lived read-side fetcher). Either way Take streams the
+		// multi-GiB memory + overlay straight to the sink — only CH's tiny
+		// config.json/state.json transit the /run tmpfs staging dir.
+		// Per-disk diff list (root, then data disks) for Take. Restored from a LOCAL
+		// snapshot ⇒ MERGE this run's resident delta onto the parent local layer
+		// (replace the next-newest layer, not stack) for BOTH --output and --upload;
+		// buildSnapshotCfg drops the parent ref to match. Cold/manifest parents stack.
+		src := snapshot.Sources{
+			SandboxID:     sandboxID,
+			APISock:       chSock,
+			MemfdFD:       mfd.FD(),
+			MemfdSize:     int64(mfd.Size()),
+			Diffs:         diffs,
+			StagingDir:    stagingDir,
+			CHApiDeadline: cfg.CHApiDeadline(),
+			SnapshotCfg:   snapCfgBuilder,
+			Quiescer:      &allQuiescer{servers: servers},
+			Logf:          logf,
+			LocalCodec:    opts.LocalCodec,
+			LocalRequired: opts.LocalRequired,
+		}
+		if mergeMemory {
+			src.MergeBaseSnapshot = memoryMergeBase
+		}
+		reattachRunningGuest := func(reason string) {
+			if reattachMUX == nil {
 				return
 			}
-			forwarder.Resume()
-		}()
-	}
-	if pinger != nil {
-		pinger.Pause()
-		// Resume on the way out UNLESS this is the success + destroy
-		// path: there the VM stays paused while destroyAfterSnapshot
-		// tears it down, so a resumed pinger only spews misleading
-		// `ping ... i/o timeout` lines against a paused/dying VM. On
-		// error (sandbox keeps running) or --resume (sandbox resumed),
-		// the pinger must come back.
-		defer func() {
-			if err == nil && !req.ResumeAfter {
-				return
+			if reattachErr := reattachMUX(); reattachErr != nil {
+				logf("stdio MUX re-attach after %s failed: %v (sandbox running, stdio detached)", reason, reattachErr)
+			} else {
+				logf("stdio MUX re-attached after %s", reason)
 			}
-			pinger.Resume()
-		}()
-		client := pinger.Client
-		if client == nil {
-			client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
 		}
-		result, qerr := guestlink.SendQuiesce(client, !dropCaches)
-		if qerr != nil {
-			err = qerr
-			logf("quiesce: %v (aborting snapshot)", err)
-			return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
+		out, err := snapshot.Take(src, sink, req.ResumeAfter)
+		if err != nil {
+			// SendQuiesce closes the old MUX and freezes the application. Take
+			// restores the VM/backend state on failure; reattach completes the
+			// guest-side recovery and thaws the application before we return.
+			if guestQuiesced {
+				reattachRunningGuest("failed snapshot")
+			}
+			return ctl.Response{}, err
 		}
-		dropCachesResult = result
-		guestQuiesced = true
-		logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
-	}
 
-	// Build snapshot.cfg builder closure. Take() invokes it with the final
-	// overlay_ref the sink produced (scheme-qualified file ref in --output mode,
-	// manifest://<key> in --upload mode) so snapshot.cfg's overlay.base is
-	// final on first write — no post-hoc ZIP rewrite.
-	cfg := opts.Cfg
-	snapCfgBuilder := func(overlayRefs []string) ([]byte, error) {
-		return buildSnapshotCfg(cfg, overlayRefs, resultMemoryRefs, diskMerged)
-	}
-
-	// opts.SandboxID is always populated by the run path (generated when the
-	// CLI didn't pass one); see Run() in this file.
-	sandboxID := opts.SandboxID
-
-	// Pick the sink. --output writes sparse, content-addressed local files;
-	// --upload streams to a fresh Ingester (its own store client, never shared
-	// with the long-lived read-side fetcher). Either way Take streams the
-	// multi-GiB memory + overlay straight to the sink — only CH's tiny
-	// config.json/state.json transit the /run tmpfs staging dir.
-	// Per-disk diff list (root, then data disks) for Take. Restored from a LOCAL
-	// snapshot ⇒ MERGE this run's resident delta onto the parent local layer
-	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
-	// buildSnapshotCfg drops the parent ref to match. Cold/manifest parents stack.
-	src := snapshot.Sources{
-		SandboxID:     sandboxID,
-		APISock:       chSock,
-		MemfdFD:       mfd.FD(),
-		MemfdSize:     int64(mfd.Size()),
-		Diffs:         diffs,
-		StagingDir:    stagingDir,
-		CHApiDeadline: cfg.CHApiDeadline(),
-		SnapshotCfg:   snapCfgBuilder,
-		Quiescer:      &allQuiescer{servers: servers},
-		Logf:          logf,
-		LocalCodec:    opts.LocalCodec,
-		LocalRequired: opts.LocalRequired,
-	}
-	if mergeMemory {
-		src.MergeBaseSnapshot = memoryMergeBase
-	}
-	reattachRunningGuest := func(reason string) {
-		if reattachMUX == nil {
-			return
+		// --resume: Take has resumed CH, but the guest closed the stdio MUX
+		// during quiesce. Re-establish it (best-effort — the snapshot itself
+		// succeeded; a reattach failure just leaves the resumed sandbox with
+		// detached stdio). Do this before any upload work so the app, which is
+		// already running again, isn't blocked on a full stdout pipe for long.
+		if req.ResumeAfter {
+			reattachRunningGuest("snapshot")
 		}
-		if reattachErr := reattachMUX(); reattachErr != nil {
-			logf("stdio MUX re-attach after %s failed: %v (sandbox running, stdio detached)", reason, reattachErr)
-		} else {
-			logf("stdio MUX re-attached after %s", reason)
-		}
-	}
-	out, err := snapshot.Take(src, sink, req.ResumeAfter)
-	if err != nil {
-		// SendQuiesce closes the old MUX and freezes the application. Take
-		// restores the VM/backend state on failure; reattach completes the
-		// guest-side recovery and thaws the application before we return.
-		if guestQuiesced {
-			reattachRunningGuest("failed snapshot")
-		}
-		return ctl.Response{}, err
-	}
 
-	// --resume: Take has resumed CH, but the guest closed the stdio MUX
-	// during quiesce. Re-establish it (best-effort — the snapshot itself
-	// succeeded; a reattach failure just leaves the resumed sandbox with
-	// detached stdio). Do this before any upload work so the app, which is
-	// already running again, isn't blocked on a full stdout pipe for long.
-	if req.ResumeAfter {
-		reattachRunningGuest("snapshot")
-	}
+		resp = ctl.Response{
+			MemorySize:       out.MemorySize,
+			MemoryResident:   out.MemoryResident,
+			WallclockPauseMs: out.WallclockPauseMs,
+			WallclockDumpMs:  out.WallclockDumpMs,
+			DropCachesResult: dropCachesResult,
+		}
+		// The response reports the ROOT overlay (out.*[0]); data-disk overlays live
+		// in the bundle's snapshot.cfg (boot.disks[]) and, in --output mode, as
+		// sibling files.
+		if !req.Upload {
+			resp.SnapshotPath = out.SnapshotPath
+			resp.OverlayPath = out.OverlayPaths[0]
+			resp.OverlayRef = out.OverlayRefs[0]
+			return resp, nil
+		}
 
-	resp = ctl.Response{
-		MemorySize:       out.MemorySize,
-		MemoryResident:   out.MemoryResident,
-		WallclockPauseMs: out.WallclockPauseMs,
-		WallclockDumpMs:  out.WallclockDumpMs,
-		DropCachesResult: dropCachesResult,
-	}
-	// The response reports the ROOT overlay (out.*[0]); data-disk overlays live
-	// in the bundle's snapshot.cfg (boot.disks[]) and, in --output mode, as
-	// sibling files.
-	if !req.Upload {
-		resp.SnapshotPath = out.SnapshotPath
-		resp.OverlayPath = out.OverlayPaths[0]
+		// Upload mode: the IngestSink already streamed the overlays + bundle to the
+		// store during Take (resident pages only). Report the manifest keys it
+		// produced (out.*Ref are manifest://<key>) plus per-artifact dedup stats.
+		// OverlayRef stays scheme-tagged — it is the snapshot bundle's overlay.base,
+		// used for from_refs chaining.
+		overlayRes, bundleRes := ingestSink.Results()
+		resp.SnapshotManifestKey = strings.TrimPrefix(out.SnapshotRef, "manifest://")
+		resp.OverlayManifestKey = strings.TrimPrefix(out.OverlayRefs[0], "manifest://")
 		resp.OverlayRef = out.OverlayRefs[0]
+		resp.Msg = fmt.Sprintf("upload OK; overlay stored=%d dedup=%d, snapshot stored=%d dedup=%d",
+			overlayRes.StoredChunks, overlayRes.DedupChunks, bundleRes.StoredChunks, bundleRes.DedupChunks)
 		return resp, nil
 	}
 
-	// Upload mode: the IngestSink already streamed the overlays + bundle to the
-	// store during Take (resident pages only). Report the manifest keys it
-	// produced (out.*Ref are manifest://<key>) plus per-artifact dedup stats.
-	// OverlayRef stays scheme-tagged — it is the snapshot bundle's overlay.base,
-	// used for from_refs chaining.
-	overlayRes, bundleRes := ingestSink.Results()
-	resp.SnapshotManifestKey = strings.TrimPrefix(out.SnapshotRef, "manifest://")
-	resp.OverlayManifestKey = strings.TrimPrefix(out.OverlayRefs[0], "manifest://")
-	resp.OverlayRef = out.OverlayRefs[0]
-	resp.Msg = fmt.Sprintf("upload OK; overlay stored=%d dedup=%d, snapshot stored=%d dedup=%d",
-		overlayRes.StoredChunks, overlayRes.DedupChunks, bundleRes.StoredChunks, bundleRes.DedupChunks)
-	return resp, nil
+	finish := func(resp ctl.Response, captureErr error) (ctl.Response, error) {
+		if captureErr == nil && !req.ResumeAfter {
+			go destroyAfterSnapshot(chSock, opts.Cfg.CHApiDeadline(), logf)
+		}
+		return resp, captureErr
+	}
+
+	snapshotCtx := opts.SnapshotContext
+	if snapshotCtx == nil {
+		snapshotCtx = context.Background()
+	}
+	if !dropCaches && opts.Balloon != nil {
+		settle := opts.BalloonCheckpointSettle
+		if settle <= 0 {
+			settle = defaultBalloonCheckpointSettle
+		}
+		var captured ctl.Response
+		checkpointErr := opts.Balloon.WithCheckpoint(snapshotCtx, settle, func() error {
+			var captureErr error
+			captured, captureErr = capture()
+			return captureErr
+		})
+		return finish(captured, checkpointErr)
+	}
+	return finish(capture())
 }
 
 // destroyAfterSnapshotDelay is how long destroyAfterSnapshot waits before
