@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
 
 // ControllerHookOptions identifies the existing sandbox/node reservation
@@ -280,10 +281,10 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		h.previousToken = res.Token
 		h.mu.Unlock()
 		if res.QueuedForMs > 0 {
-			h.opts.Logf("controller admit: token=%s initial_reservation=%d (queued %dms, pos %d at entry)",
-				shortToken(res.Token), initialBudget, res.QueuedForMs, res.QueuePosAtIn)
+			h.opts.Logf("controller admit: token=%s initial_reservation=%s (queued %dms, pos %d at entry)",
+				shortToken(res.Token), util.FormatMiB(initialBudget), res.QueuedForMs, res.QueuePosAtIn)
 		} else {
-			h.opts.Logf("controller admit: token=%s initial_reservation=%d", shortToken(res.Token), initialBudget)
+			h.opts.Logf("controller admit: token=%s initial_reservation=%s", shortToken(res.Token), util.FormatMiB(initialBudget))
 		}
 		return initialBudget, nil
 	}
@@ -506,8 +507,8 @@ func (h *ControllerHooks) reconnectLoop() {
 					h.connected, h.previousToken = true, result.Token
 					h.mu.Unlock()
 					h.sessionMu.Unlock()
-					h.opts.Logf("controller state sync restored token=%s reservation=%d settled=%v",
-						shortToken(result.Token), state.reservation, state.settled)
+					h.opts.Logf("controller state sync restored token=%s reservation=%s settled=%v",
+						shortToken(result.Token), util.FormatMiB(state.reservation), state.settled)
 					break
 				}
 				err = syncErr

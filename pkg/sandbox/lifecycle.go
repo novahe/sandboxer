@@ -42,6 +42,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
@@ -339,7 +340,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		return -1, err
 	}
 	initialBudget = grantedInitial
-	logf("initial cold Budget reserved=%d", initialBudget)
+	logf("initial cold Budget reserved=%s", util.FormatMiB(initialBudget))
 	if balloonCtl != nil {
 		if err := balloonCtl.SeedColdTarget(resctl.TargetForBudget(capBytes, initialBudget)); err != nil {
 			return -1, fmt.Errorf("seed cold balloon target: %w", err)
@@ -2421,10 +2422,10 @@ func handleSnapshotRequest(
 		if captureErr != nil {
 			logf("snapshot: freeze memory observation unavailable: %v", captureErr)
 		} else {
-			logf("snapshot: freeze memory MemAvailable=%d Cached=%d BalloonTarget=%d BalloonCurrent=%d TargetBudget=%d CurrentBudget=%d ObservedBudget=%d Reservation=%d report=%d/%d",
-				freeze.GuestMemAvailable, freeze.GuestCached, freeze.BalloonTarget,
-				freeze.BalloonCurrent, freeze.TargetBudget, freeze.CurrentBudget,
-				freeze.ObservedBudget, freeze.Reservation, freeze.ReportEpoch, freeze.ReportSeq)
+			logf("snapshot: freeze memory MemAvailable=%s Cached=%s BalloonTarget=%s BalloonCurrent=%s TargetBudget=%s CurrentBudget=%s ObservedBudget=%s Reservation=%s report=%d/%d",
+				util.FormatMiB(freeze.GuestMemAvailable), util.FormatMiB(freeze.GuestCached), util.FormatMiB(freeze.BalloonTarget),
+				util.FormatMiB(freeze.BalloonCurrent), util.FormatMiB(freeze.TargetBudget), util.FormatMiB(freeze.CurrentBudget),
+				util.FormatMiB(freeze.ObservedBudget), util.FormatMiB(freeze.Reservation), freeze.ReportEpoch, freeze.ReportSeq)
 		}
 	}
 

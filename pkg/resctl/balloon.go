@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
 
 var errShrinkObservationChanged = errors.New("balloon shrink decision changed")
@@ -309,9 +310,9 @@ func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, shrinkObse
 		state := b.commitObservation(post)
 		if state.AcceptedTarget == desired {
 			if resizeErr != nil {
-				b.Logf("balloon: confirmed target=%d after lost/ambiguous resize response", desired)
+				b.Logf("balloon: confirmed target=%s after lost/ambiguous resize response", util.FormatMiB(desired))
 			} else {
-				b.Logf("balloon: CH accepted target=%d", desired)
+				b.Logf("balloon: CH accepted target=%s", util.FormatMiB(desired))
 			}
 			return state, nil
 		}

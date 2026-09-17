@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"golang.org/x/sys/unix"
 )
 
@@ -436,7 +437,7 @@ func (m *MemoryController) advanceNormalizationLocked(ctx context.Context) error
 	m.normalizationPending = false
 	m.state.RestoreNormalization = false
 	m.openReportBarrier()
-	m.logf("memory: restore SafeTarget normalization accepted target=%d", m.normalizationTarget)
+	m.logf("memory: restore SafeTarget normalization accepted target=%s", util.FormatMiB(m.normalizationTarget))
 	return nil
 }
 
@@ -503,8 +504,8 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 					return err
 				}
 			}
-			m.logf("memory: observed Budget=%d exceeds reservation=%d; pending shrink discarded",
-				budget.ObservedBudget, m.reservationNow())
+			m.logf("memory: observed Budget=%s exceeds reservation=%s; pending shrink discarded",
+				util.FormatMiB(budget.ObservedBudget), util.FormatMiB(m.reservationNow()))
 			m.finishShrinkLocked(txn)
 			return nil
 		}
@@ -574,8 +575,8 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 	if budget.ObservedBudget > m.reservationNow() {
 		// Cold/emergency actual is not a node grant. Keep the existing high;
 		// normal demand/pressure grow remains the only way to obtain more.
-		m.logf("memory: observed Budget=%d exceeds reservation=%d; settlement and new inflate deferred",
-			budget.ObservedBudget, m.reservationNow())
+		m.logf("memory: observed Budget=%s exceeds reservation=%s; settlement and new inflate deferred",
+			util.FormatMiB(budget.ObservedBudget), util.FormatMiB(m.reservationNow()))
 		return nil
 	}
 
@@ -778,7 +779,7 @@ func (m *MemoryController) applyPreparedGrowLocked(ctx context.Context, txn *mem
 	} else if txn.target != 0 {
 		return fmt.Errorf("grow target=%d without balloon device", txn.target)
 	}
-	m.logf("memory: grow accepted Budget=%d target=%d reservation=%d", txn.targetBudget, txn.target, m.reservationNow())
+	m.logf("memory: grow accepted Budget=%s target=%s reservation=%s", util.FormatMiB(txn.targetBudget), util.FormatMiB(txn.target), util.FormatMiB(m.reservationNow()))
 	txn.targetChange = false
 	if txn.targetBudget >= objective {
 		m.txn = nil
@@ -860,7 +861,7 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 			if resetErr := m.balloon.SetDesiredTarget(state.AcceptedTarget); resetErr != nil {
 				return resetErr
 			}
-			m.logf("memory: discarded unexecuted shrink target=%d: %v", txn.target, err)
+			m.logf("memory: discarded unexecuted shrink target=%s: %v", util.FormatMiB(txn.target), err)
 			m.finishShrinkLocked(txn)
 			return nil
 		}
@@ -887,7 +888,7 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 	if budget > reservation {
 		// Autonomous deflate is not an authorization to raise high or to claim
 		// a larger node reservation. A fresh demand/pressure event can grow.
-		m.logf("memory: observed Budget=%d exceeds reservation=%d; settlement deferred", budget, reservation)
+		m.logf("memory: observed Budget=%s exceeds reservation=%s; settlement deferred", util.FormatMiB(budget), util.FormatMiB(reservation))
 		m.finishShrinkLocked(txn)
 		return nil
 	}
@@ -948,7 +949,7 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 		if newReservation != budget {
 			return fmt.Errorf("shrink commit returned reservation=%d, want %d", newReservation, budget)
 		}
-		m.logf("memory: shrink settled Budget=%d target=%d current=%d", budget, state.AcceptedTarget, state.BalloonCurrent)
+		m.logf("memory: shrink settled Budget=%s target=%s current=%s", util.FormatMiB(budget), util.FormatMiB(state.AcceptedTarget), util.FormatMiB(state.BalloonCurrent))
 	}
 	// This round's host operations are done. Remaining guest progress is
 	// observed by later reports, not an unfinishable equality transaction.

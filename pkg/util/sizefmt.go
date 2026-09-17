@@ -95,3 +95,9 @@ func ParseSize(s string) (uint64, error) {
 	}
 	return quotient.Uint64(), nil
 }
+
+// FormatMiB formats a byte count in MiB with one decimal place
+// with ties rounded to even.
+func FormatMiB(bytes uint64) string {
+	return fmt.Sprintf("%.1fMiB", float64(bytes)/(1<<20))
+}

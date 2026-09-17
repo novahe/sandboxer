@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"golang.org/x/sys/unix"
 )
 
@@ -139,8 +140,8 @@ func (s *PressureSensor) runPSI(ctx context.Context) error {
 		return fmt.Errorf("epoll_ctl ADD: %w", err)
 	}
 
-	s.logf("sensor: PSI mode active (trigger=%q debounce=%s step=%d)",
-		trig, s.runtime.MinInterval, resource.MemoryStep)
+	s.logf("sensor: PSI mode active (trigger=%q debounce=%s step=%s)",
+		trig, s.runtime.MinInterval, util.FormatMiB(resource.MemoryStep))
 
 	// OOM sidecar.
 	sideCtx, cancelSide := context.WithCancel(ctx)
@@ -237,7 +238,7 @@ func (s *PressureSensor) runOOMSidecar(ctx context.Context) {
 // runEventsPoll is the legacy 100ms poll path. Used as fallback when
 // PSI trigger setup fails OR when config.SensorConfig.Mode is "events_poll".
 func (s *PressureSensor) runEventsPoll(ctx context.Context) {
-	s.logf("sensor: events_poll mode active (100ms tick step=%d)", resource.MemoryStep)
+	s.logf("sensor: events_poll mode active (100ms tick step=%s)", util.FormatMiB(resource.MemoryStep))
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 	var lastHigh, lastOOM, previousHostCharge uint64

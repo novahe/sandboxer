@@ -39,6 +39,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
@@ -411,8 +412,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if initialBudget != budgetAtSnapshot {
 		return -1, fmt.Errorf("restore initial Budget=%d, require BudgetAtSnapshot=%d", initialBudget, budgetAtSnapshot)
 	}
-	logf("restore BudgetAtSnapshot reserved=%d (balloon target/current=%d/%d)",
-		budgetAtSnapshot, balTarget, balCurrent)
+	logf("restore BudgetAtSnapshot reserved=%s (balloon target/current=%s/%s)",
+		util.FormatMiB(budgetAtSnapshot), util.FormatMiB(balTarget), util.FormatMiB(balCurrent))
 	memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
 		Config: &snapCfg, CgroupPath: cg.LocalPath(), Balloon: balloonCtl,
 		Reservation: hooks, InitialBudget: initialBudget, Logf: logf,
