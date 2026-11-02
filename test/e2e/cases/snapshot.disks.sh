@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Snapshot/restore captures root plus ordered writable data-disk state.
+# Small shared COW budgets must bound real I/O before and after restore.
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -65,7 +66,7 @@ truncate -s 256M "$WORK/dataset.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset.ext4"
 
 cat >"$WORK/cold.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB }, diff_cow: { cache_size: 4MiB, max_dirty_size: 2MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: snapshot-disks }
 boot:
   kernel: file://$BIN/vmlinux
@@ -95,10 +96,54 @@ wait_exec() {
     return 1
 }
 
+# The cache stats are shared totals repeated by each writable backend, not
+# separate per-disk allowances. Do not sum them. Peaks survive final draining.
+assert_cache_budget() { # stats JSON, total bytes, dirty bytes
+    python3 - "$1" "$2" "$3" <<'PY_STATS'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as source:
+    report = json.load(source)
+capacity, dirty = map(int, sys.argv[2:])
+caches = [backend['extra']['diff_cow_cache'] for backend in report['backends']
+          if 'diff_cow_cache' in backend.get('extra', {})]
+assert len(caches) == 3, caches  # root, scratch and dataset
+for cache in caches:
+    assert cache['Capacity'] == capacity, cache
+    assert cache['MaxDirty'] == dirty, cache
+    assert 0 <= cache['Used'] <= capacity, cache
+    assert 0 <= cache['DirtyUsed'] <= dirty, cache
+    assert cache['PeakUsed'] == capacity, cache  # workload exercised eviction
+    assert 0 < cache['PeakDirty'] <= dirty, cache
+    assert cache['WrittenBytes'] >= 48 * (1 << 20), cache
+    assert cache['WriteBatches'] > 0, cache
+# Each backend must report the same shared lifetime counters/budget. Occupancy
+# can change between snapshots, so only compare stable final/monotonic fields.
+for field in ('Capacity', 'MaxDirty', 'PeakUsed', 'PeakDirty', 'WrittenBytes', 'WriteBatches'):
+    assert len({cache[field] for cache in caches}) == 1, (field, caches)
+PY_STATS
+}
+
+write_cache_payload() {
+    "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
+        set -e
+        for dir in / /scratch/ /data/; do
+            dd if=/dev/urandom of="${dir}cache-payload" bs=1048576 count=16 conv=fsync 2>/dev/null
+        done
+        sync
+    '
+}
+cache_payload_hash() {
+    "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
+        set -e
+        echo 3 > /proc/sys/vm/drop_caches
+        sha256sum /cache-payload /scratch/cache-payload /data/cache-payload
+    '
+}
+
 SID="snapshot-disks-$BASHPID"
 LOG1="$OUT/cold.log"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" >"$LOG1" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" --stats-json "$OUT/cold.stats.json" >"$LOG1" 2>&1 &
 PID1=$!
 PIDS+=("$PID1")
 wait_exec "$SID" "$PID1" || {
@@ -108,9 +153,13 @@ wait_exec "$SID" "$PID1" || {
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'set -e; grep -qx DATASET-OK /data/DATASET-OK; echo ROOT-S-OK > /root-s; echo SCRATCH-S-OK > /scratch/persist; echo DATA-S-OK > /data/persist; sync'
 
+write_cache_payload
+cache_payload_hash >"$OUT/cold.sha256"
+
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$WORK/snapshot" --run-root "$WORK/runtime" >"$OUT/snapshot.log" 2>&1
 wait "$PID1" || true
 PIDS=()
+assert_cache_budget "$OUT/cold.stats.json" $((4 << 20)) $((2 << 20))
 SNAPSHOT="$WORK/snapshot/$SID.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "multi-disk snapshot is missing"
 "$BIN/sandbox-ctl" info --json "$SNAPSHOT" >"$WORK/snapshot.json"
@@ -127,6 +176,7 @@ python3 - "$WORK/sandbox-e.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as source:
     cfg = json.load(source)
+assert 'DiffCOW' not in cfg['Resources'], cfg['Resources']
 disks = cfg['Boot'].get('Disks') or []
 assert [disk.get('Name') for disk in disks] == ['scratch', 'dataset'], disks
 root = cfg['Boot']['Root']
@@ -142,7 +192,7 @@ PY
 test ! -e "$WORK/root-restore.ext4"
 test ! -e "$WORK/dataset-restore.ext4"
 cat >"$WORK/restore.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB }, diff_cow: { cache_size: 8MiB, max_dirty_size: 4MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: snapshot-disks-r }
 boot:
   kernel: file://$BIN/vmlinux
@@ -156,7 +206,7 @@ EOF
 
 LOG2="$OUT/restore.log"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAPSHOT" --config "$WORK/restore.yaml" --sandbox-id "$SID" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" >"$LOG2" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" --stats-json "$OUT/restore.stats.json" >"$LOG2" 2>&1 &
 PID2=$!
 PIDS+=("$PID2")
 wait_exec "$SID" "$PID2" || {
@@ -166,8 +216,18 @@ wait_exec "$SID" "$PID2" || {
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'set -e; grep -qx ROOT-S-OK /root-s; grep -qx SCRATCH-S-OK /scratch/persist; grep -qx DATA-S-OK /data/persist; grep -qx DATASET-OK /data/DATASET-OK'
 
+cache_payload_hash >"$OUT/restore.sha256"
+cmp "$OUT/cold.sha256" "$OUT/restore.sha256"
+# Force writeback and eviction in the new cache too, not just a read-only restore.
+write_cache_payload
+cache_payload_hash >"$OUT/restore-rewrite.sha256"
+if cmp -s "$OUT/cold.sha256" "$OUT/restore-rewrite.sha256"; then
+    e2e_fail "restored random overwrite did not change payloads"
+fi
+
 kill -TERM "$PID2"
 wait "$PID2" || true
 PIDS=()
+assert_cache_budget "$OUT/restore.stats.json" $((8 << 20)) $((4 << 20))
 
 echo "PASS snapshot.disks.sh"
