@@ -156,12 +156,19 @@ func runCmd(args []string) int {
 			readyFDSet = true
 		}
 	})
+	var readinessTiming *sandbox.ReadinessTiming
+	if readyFDSet {
+		readinessTiming = &sandbox.ReadinessTiming{
+			Version:               1,
+			SandboxCtlStartUnixNs: time.Now().UnixNano(),
+		}
+	}
 	var readyWriter *readiness.Writer
 	if readyFDSet {
 		var err error
 		readyWriter, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
 			log.Printf("[sandbox-ctl] "+format, args...)
-		})
+		}, readinessTiming)
 		if err != nil {
 			fmt.Fprintf(diagnostics, "sandbox-ctl run: %v\n", err)
 			return 2
@@ -359,7 +366,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, readinessTiming, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -412,6 +419,7 @@ func runCmd(args []string) int {
 		PingFatalThreshold: *pingFatal,
 		Forwards:           forwards,
 		NotifyReadiness:    notifyReadiness,
+		ReadinessTiming:    readinessTiming,
 	})
 	if err != nil {
 		fmt.Fprintln(diagnostics, err)
@@ -430,7 +438,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
+	notifyReadiness sandbox.ReadinessNotify, readinessTiming *sandbox.ReadinessTiming, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -502,6 +510,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		PingFatalThreshold:  pingFatal,
 		Forwards:            forwards,
 		NotifyReadiness:     notifyReadiness,
+		ReadinessTiming:     readinessTiming,
 	})
 	if err != nil {
 		fmt.Fprintln(diagnostics, err)

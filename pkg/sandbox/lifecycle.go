@@ -94,6 +94,9 @@ type RunOptions struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness ReadinessNotify
+	// ReadinessTiming carries sandbox-ctl/CH/restore points to the readiness
+	// bridge. nil preserves the historical plain readiness wire.
+	ReadinessTiming *ReadinessTiming
 }
 
 // RunSourceBinding is the non-serializable provenance needed to resolve the
@@ -323,6 +326,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsJSONPath = opts.StatsJSONPath
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
+	shape.ReadinessTiming = opts.ReadinessTiming
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
 	shape.preparedHost = &hostIdentity
 	if err := preparation.seal(shape, &launch); err != nil {

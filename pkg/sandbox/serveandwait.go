@@ -80,16 +80,17 @@ type CmdEnv struct {
 //     continues into the normal graceful CH shutdown/escalation path while
 //     backend services remain on their separate VM lifecycle context.
 type PostSpawnCtx struct {
-	Ctx          context.Context
-	Cmd          *exec.Cmd
-	Pinger       *guestlink.Pinger
-	Launch       *guestlink.LaunchServer
-	EstablishMUX func(net.Conn, proto.StdioSpec) error
-	Hooks        *resctl.ControllerHooks
-	Memory       *resctl.MemoryController
-	CHSock       string
-	Logf         func(string, ...any)
-	NotifyReady  func()
+	Ctx             context.Context
+	Cmd             *exec.Cmd
+	Pinger          *guestlink.Pinger
+	Launch          *guestlink.LaunchServer
+	EstablishMUX    func(net.Conn, proto.StdioSpec) error
+	Hooks           *resctl.ControllerHooks
+	Memory          *resctl.MemoryController
+	CHSock          string
+	Logf            func(string, ...any)
+	NotifyReady     func()
+	ReadinessTiming *ReadinessTiming
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -182,6 +183,7 @@ type VMParams struct {
 	// barrier; restore instead calls PostSpawnCtx.NotifyReady explicitly after
 	// its restore ACK and host-side MUX establishment.
 	NotifyReadiness   ReadinessNotify
+	ReadinessTiming   *ReadinessTiming
 	ReadyOnAppStarted bool
 }
 
@@ -1083,6 +1085,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		backendWG.Wait()
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
+	if p.ReadinessTiming != nil {
+		p.ReadinessTiming.CHStartUnixNs = time.Now().UnixNano()
+	}
 	if err := startCH(cmd, p.NetnsFile); err != nil {
 		cancelBackends()
 		backendWG.Wait()
@@ -1146,16 +1151,17 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          postSpawnCtx,
-		Cmd:          cmd,
-		Pinger:       pinger,
-		Launch:       launch,
-		EstablishMUX: establishMUX,
-		Hooks:        p.Hooks,
-		Memory:       p.Memory,
-		CHSock:       chSock,
-		Logf:         logf,
-		NotifyReady:  notifyReady,
+		Ctx:             postSpawnCtx,
+		Cmd:             cmd,
+		Pinger:          pinger,
+		Launch:          launch,
+		EstablishMUX:    establishMUX,
+		Hooks:           p.Hooks,
+		Memory:          p.Memory,
+		CHSock:          chSock,
+		Logf:            logf,
+		NotifyReady:     notifyReady,
+		ReadinessTiming: p.ReadinessTiming,
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()

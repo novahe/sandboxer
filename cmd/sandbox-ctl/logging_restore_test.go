@@ -19,7 +19,7 @@ func TestRestoreDiagnosticUsesSelectedComponentWriter(t *testing.T) {
 		return runRestore(context.Background(), cfg, config.FieldPresence{}, nil,
 			"manifest://deadbeef", "test", "", "/nonexistent/cloud-hypervisor",
 			root, root, "", stdio.Defaults, 0, 0, nil, nil,
-			nil, nil, nil, false, nil, &diagnostics)
+			nil, nil, nil, false, nil, nil, &diagnostics)
 	})
 	if rc != 1 || !strings.Contains(diagnostics.String(), "restore.prefetch") {
 		t.Fatalf("rc=%d diagnostics=%q", rc, diagnostics.String())

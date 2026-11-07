@@ -3,6 +3,7 @@
 package readiness
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"sync"
@@ -25,6 +26,7 @@ type Writer struct {
 	ready        bool
 	closed       bool
 	loggedError  bool
+	timing       *sandbox.ReadinessTiming
 }
 
 // NewWriter transfers ownership of w to the returned Writer. A nil w disables
@@ -77,7 +79,7 @@ func (w *Writer) Notify(event sandbox.ReadinessEvent) {
 			_ = w.closeLocked()
 			return
 		}
-		if err := w.writeLineLocked(event); err != nil {
+		if err := w.writeReadyLocked(); err != nil {
 			w.failLocked("write ready", err)
 			return
 		}
@@ -92,6 +94,35 @@ func (w *Writer) Notify(event sandbox.ReadinessEvent) {
 
 func (w *Writer) writeLineLocked(event sandbox.ReadinessEvent) error {
 	return wireio.WriteAll(w.w, []byte(string(event)+"\n"))
+}
+
+// SetTiming attaches launch timing points to the ready notification. When
+// non-nil, the ready line becomes "ready\t{json}" so the supervisor can
+// correlate sandbox-ctl/CH/restore instants with its own wall clock. A nil
+// timing preserves the historical plain "ready" line. It must be called
+// before Notify(ReadinessReady); later calls are ignored.
+func (w *Writer) SetTiming(t *sandbox.ReadinessTiming) {
+	if w == nil || t == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ready || w.closed {
+		return
+	}
+	w.timing = t
+}
+
+func (w *Writer) writeReadyLocked() error {
+	if w.timing == nil {
+		return w.writeLineLocked(sandbox.ReadinessReady)
+	}
+	b, err := json.Marshal(w.timing)
+	if err != nil {
+		return err
+	}
+	w.logf("readiness timing: %s", b)
+	return wireio.WriteAll(w.w, append(append([]byte("ready\t"), b...), '\n'))
 }
 
 func (w *Writer) failLocked(op string, err error) {

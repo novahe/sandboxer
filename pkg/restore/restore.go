@@ -96,6 +96,9 @@ type Options struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
+	// ReadinessTiming carries sandbox-ctl/CH/restore points to the readiness
+	// bridge. nil preserves the historical plain readiness wire.
+	ReadinessTiming *sandbox.ReadinessTiming
 
 	checkpointReleaseSources func() error // temporary source pins; writers own the handoff
 }
@@ -633,6 +636,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		Forwards:        opts.Forwards,
 		Cgroup:          cg,
 		NotifyReadiness: opts.NotifyReadiness,
+		ReadinessTiming: opts.ReadinessTiming,
 
 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
 			// CH 51 `--restore source_url=file://<dir>` replaces
@@ -673,6 +677,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}
+			if pc.ReadinessTiming != nil {
+				pc.ReadinessTiming.CHResumeDoneUnixNs = time.Now().UnixNano()
+			}
 			pc.Logf("VM resumed, vCPU running")
 
 			tRestore := time.Now()
@@ -683,9 +690,13 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
-			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
+			muxSpec, err := openAndEstablishRestoreMUXWithAck(func() (net.Conn, proto.StdioSpec, error) {
 				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
-			}, pc.EstablishMUX, pc.NotifyReady)
+			}, pc.EstablishMUX, func() {
+				if pc.ReadinessTiming != nil {
+					pc.ReadinessTiming.SandboxInitAckUnixNs = time.Now().UnixNano()
+				}
+			}, pc.NotifyReady)
 			if err != nil {
 				return err
 			}
@@ -734,9 +745,21 @@ func openAndEstablishRestoreMUX(
 	establish func(net.Conn, proto.StdioSpec) error,
 	notifyReady func(),
 ) (proto.StdioSpec, error) {
+	return openAndEstablishRestoreMUXWithAck(open, establish, nil, notifyReady)
+}
+
+func openAndEstablishRestoreMUXWithAck(
+	open func() (net.Conn, proto.StdioSpec, error),
+	establish func(net.Conn, proto.StdioSpec) error,
+	notifyAck func(),
+	notifyReady func(),
+) (proto.StdioSpec, error) {
 	conn, spec, err := open()
 	if err != nil {
 		return proto.StdioSpec{}, fmt.Errorf("notify restore: %w (guest agent unreachable)", err)
+	}
+	if notifyAck != nil {
+		notifyAck()
 	}
 	if err := establish(conn, spec); err != nil {
 		// EstablishMUX did not take ownership on failure.

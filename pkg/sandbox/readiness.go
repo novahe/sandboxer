@@ -2,6 +2,19 @@ package sandbox
 
 import "sync"
 
+// ReadinessTiming is the sandbox-ctl-side portion of the launch timeline.
+// Unix nanoseconds keep the wire compact and let node-ctl correlate these
+// points with its own wall clock without relying on process-relative clocks.
+// Zero fields mean that the phase does not exist on this boot path (for
+// example, CH resume and restore ACK are absent on a cold image boot).
+type ReadinessTiming struct {
+	Version               int   `json:"version"`
+	SandboxCtlStartUnixNs int64 `json:"sandbox_ctl_start_unix_ns"`
+	CHStartUnixNs         int64 `json:"ch_start_unix_ns,omitempty"`
+	CHResumeDoneUnixNs    int64 `json:"ch_resume_done_unix_ns,omitempty"`
+	SandboxInitAckUnixNs  int64 `json:"sandbox_init_ack_unix_ns,omitempty"`
+}
+
 // ReadinessEvent is one startup milestone emitted by sandbox-ctl run.
 type ReadinessEvent string
 

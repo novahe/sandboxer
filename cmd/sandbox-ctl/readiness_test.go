@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"golang.org/x/sys/unix"
 )
 
@@ -86,7 +87,7 @@ func TestReadinessFDWriterSetsCLOEXEC(t *testing.T) {
 	}
 	defer r.Close()
 	readyFD := transferReadinessFD(t, w)
-	n, err := newReadinessFDWriter(readyFD, nil)
+	n, err := newReadinessFDWriter(readyFD, nil, nil)
 	if err != nil {
 		_ = unix.Close(readyFD)
 		t.Fatal(err)
@@ -98,5 +99,56 @@ func TestReadinessFDWriterSetsCLOEXEC(t *testing.T) {
 	}
 	if flags&unix.FD_CLOEXEC == 0 {
 		t.Fatal("ready fd is missing FD_CLOEXEC")
+	}
+}
+
+func TestReadinessFDWriterTimingPayload(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	readyFD := transferReadinessFD(t, w)
+	timing := &sandbox.ReadinessTiming{
+		Version: 1, SandboxCtlStartUnixNs: 100, CHStartUnixNs: 200,
+		CHResumeDoneUnixNs: 300, SandboxInitAckUnixNs: 400,
+	}
+	n, err := newReadinessFDWriter(readyFD, nil, timing)
+	if err != nil {
+		_ = unix.Close(readyFD)
+		t.Fatal(err)
+	}
+	n.Notify(sandbox.ReadinessControlReady)
+	n.Notify(sandbox.ReadinessReady)
+	body, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "control_ready\nready\t{\"version\":1,\"sandbox_ctl_start_unix_ns\":100,\"ch_start_unix_ns\":200,\"ch_resume_done_unix_ns\":300,\"sandbox_init_ack_unix_ns\":400}\n"
+	if string(body) != want {
+		t.Fatalf("readiness wire = %q, want %q", body, want)
+	}
+}
+
+func TestReadinessFDWriterPlainReadyWithoutTiming(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, nil, nil)
+	if err != nil {
+		_ = unix.Close(readyFD)
+		t.Fatal(err)
+	}
+	n.Notify(sandbox.ReadinessControlReady)
+	n.Notify(sandbox.ReadinessReady)
+	body, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(body), "control_ready\nready\n"; got != want {
+		t.Fatalf("readiness wire = %q, want %q", got, want)
 	}
 }

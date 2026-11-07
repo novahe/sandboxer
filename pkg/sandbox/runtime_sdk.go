@@ -65,6 +65,9 @@ type RuntimeSpec struct {
 	StatsJSONPath                   string
 	StatsInterval                   time.Duration
 	NotifyReadiness                 ReadinessNotify
+	// ReadinessTiming carries sandbox-ctl/CH instants to the readiness bridge.
+	// nil preserves the historical plain readiness wire.
+	ReadinessTiming *ReadinessTiming
 	logf                            func(string, ...any) // executable adapter only; SDK defaults to sandbox-sdk
 }
 
@@ -474,6 +477,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 		Logf: r.logf, StartUnixNs: r.startUnixNs, StatsJSONPath: spec.StatsJSONPath, StatsInterval: spec.StatsInterval,
 		PingFatalThreshold: spec.PingFatalThreshold, VAReportDeadline: cfg.VAReportDeadline(), PingTimeout: cfg.PingDeadline(), AppNotifyDeadline: cfg.AppNotifyDeadline(),
 		SnapCfg: cfg, WireLaunchMUX: true, ReadyOnAppStarted: true, NotifyReadiness: spec.NotifyReadiness,
+		ReadinessTiming: spec.ReadinessTiming,
 		owner: r,
 		BuildCmd: func(e CmdEnv) (*exec.Cmd, func(), error) {
 			cmd := exec.Command(chBinary)
