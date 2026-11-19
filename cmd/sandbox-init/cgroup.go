@@ -329,6 +329,7 @@ func cgroupFreeze() error {
 			return nil
 		}
 		if time.Now().After(deadline) {
+			dumpCgroupFreezeTree(appCgroupDir, "/proc", logf)
 			return fmt.Errorf("cgroup.events frozen 1 not observed within %s", freezeConfirmTimeout)
 		}
 		time.Sleep(freezePollInterval)
